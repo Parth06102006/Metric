@@ -1,0 +1,21 @@
+# Local Docker preview only. Production uses compose.yaml with oauth2-proxy.
+#
+# Usage:
+#   docker compose --env-file .env.local -f compose.yaml -f compose.local.yaml up -d --build
+#
+# This bypasses SSO and uses AUTH_MODE=dev. Do not use it on a public host.
+
+services:
+  api:
+    environment:
+      APP_ENV: development
+      AUTH_MODE: dev
+      DEV_USER_EMAIL: dev@localhost
+      PROXY_SHARED_SECRET: ""
+
+  edge:
+    environment:
+      SITE_ADDRESS: ":80"
+      PROXY_SHARED_SECRET: ""
+    volumes:
+      - ./deploy/Caddyfile.local:/etc/caddy/Caddyfile:ro

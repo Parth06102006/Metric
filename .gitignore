@@ -18,20 +18,35 @@ coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
+# Dependency directories
 # vendor/
 
 # Go workspace file
 go.work
 go.work.sum
 
-# env file
+# Node / web
+node_modules/
+dist/
+apps/web/dist/
+apps/web/.vite/
+coverage/
+
+# Build output
+/bin/
+
+# Environment files
 .env
+.env.local
+.env.*.local
+!.env.example
 
 # Editor/IDE
 # .idea/
 # .vscode/
 
-# Local database
+# Local databases
 traffic.db
-
+*.db
+*.db-wal
+*.db-shm

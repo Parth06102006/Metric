@@ -1,0 +1,65 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# SITE_ADDRESS is a hostname (metrics.example.com) in production, or :80 for a
+# local HTTP-only smoke test. oauth2-proxy needs HTTPS for secure cookies.
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' wss://{host}; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+
+	# Liveness probe. Public so the container healthcheck needs no session.
+	handle /health {
+		reverse_proxy api:8080
+	}
+
+	# Machine ingest. X-API-Key is verified in Go, so SSO must not intercept it.
+	handle /ingest/* {
+		reverse_proxy api:8080
+	}
+
+	# oauth2-proxy owns login, callback, sign-out, and the auth endpoint.
+	handle /oauth2/* {
+		reverse_proxy oauth2-proxy:4180
+	}
+
+	# Live stream. Authenticate at the handshake, then stream without buffering.
+	handle /ws/* {
+		forward_auth oauth2-proxy:4180 {
+			uri /oauth2/auth
+			copy_headers X-Auth-Request-Email X-Auth-Request-User
+		}
+		reverse_proxy api:8080 {
+			header_up Host {host}
+			header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
+			flush_interval -1
+		}
+	}
+
+	# Control plane. Unauthenticated requests receive 401 from oauth2-proxy.
+	handle /api/* {
+		forward_auth oauth2-proxy:4180 {
+			uri /oauth2/auth
+			copy_headers X-Auth-Request-Email X-Auth-Request-User
+		}
+		reverse_proxy api:8080 {
+			header_up Host {host}
+			header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
+		}
+	}
+
+	# Built SPA, with client-side routing fallback.
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+	}
+}
