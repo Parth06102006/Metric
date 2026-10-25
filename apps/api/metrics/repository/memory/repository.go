@@ -72,6 +72,16 @@ func (r *Repository) ActiveProjects(_ context.Context) []string {
 	return ids
 }
 
+// Delete drops a project's live window so the worker stops computing
+// snapshots for it.
+func (r *Repository) Delete(_ context.Context, projectID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.projects, projectID)
+	return nil
+}
+
 func prune(records []domain.LogRecord, cutoff time.Time) []domain.LogRecord {
 	active := records[:0]
 	for _, record := range records {

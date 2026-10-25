@@ -26,6 +26,42 @@ func TestHubDeliversToSubscribers(t *testing.T) {
 	}
 }
 
+func TestHubDropDisconnectsSubscribers(t *testing.T) {
+	hub := ws.NewHub()
+	first := hub.Register("p1")
+	second := hub.Register("p1")
+	other := hub.Register("p2")
+	defer hub.Unregister("p2", other)
+
+	hub.Drop("p1")
+
+	for _, subscriber := range []*ws.Client{first, second} {
+		select {
+		case <-subscriber.Done():
+		case <-time.After(time.Second):
+			t.Fatal("dropped project subscriber must observe done")
+		}
+	}
+
+	// Other projects stay connected.
+	if hub.SubscriberCount("p1") != 0 {
+		t.Fatalf("SubscriberCount after Drop = %d, want 0", hub.SubscriberCount("p1"))
+	}
+	if hub.SubscriberCount("p2") != 1 {
+		t.Fatalf("SubscriberCount(other) after Drop = %d, want 1", hub.SubscriberCount("p2"))
+	}
+
+	hub.BroadcastSnapshot("p2", domain.Snapshot{RPS: 1})
+	select {
+	case message := <-other.Send():
+		if len(message) == 0 {
+			t.Fatal("empty message")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for broadcast on surviving project")
+	}
+}
+
 func TestHubConcurrentBroadcastAndUnregister(t *testing.T) {
 	hub := ws.NewHub()
 

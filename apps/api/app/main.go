@@ -15,6 +15,8 @@ import (
 
 	"traffic-center/anomaly"
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
+	"traffic-center/audit"
+	auditsqlite "traffic-center/audit/repository/sqlite"
 	"traffic-center/ingest"
 	"traffic-center/internal/config"
 	"traffic-center/internal/llm"
@@ -53,6 +55,10 @@ func run() error {
 		logger.Warn("authentication is disabled (AUTH_MODE=dev)", "dev_email", cfg.DevEmail)
 	}
 
+	if cfg.Env == "production" && len(cfg.AdminEmails) == 0 {
+		logger.Warn("ADMIN_EMAILS is empty in production; admin actions will be denied")
+	}
+
 	db, err := sqlite.Open(cfg.DatabasePath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
@@ -65,16 +71,19 @@ func run() error {
 	recordRepo := metricsmemory.New(cfg.MetricsWindow)
 	snapshotRepo := metricssqlite.New(db)
 	anomalyRepo := anomalysqlite.New(db)
+	auditRepo := auditsqlite.New(db)
 	hub := ws.NewHub()
 
 	// Usecases.
 	projectUsecase := project.NewUsecase(projectRepo)
+	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub)
 	thresholdUsecase := threshold.NewUsecase(thresholdRepo, projectRepo)
 	metricsUsecase := metrics.NewUsecase(recordRepo, snapshotRepo, cfg.MetricsWindow)
 	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo)
 
 	explainer := llm.New(cfg.GeminiAPIKey, cfg.GeminiModel)
 	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, explainer, hub, cfg.DedupeWindow)
+	auditUsecase := audit.NewUsecase(auditRepo, logger)
 
 	worker := anomaly.NewWorker(
 		recordRepo,
@@ -89,12 +98,20 @@ func run() error {
 	worker.Start()
 	defer worker.Stop()
 
+	// Audit retention runs alongside snapshot retention: an hourly pass
+	// deletes audit events older than AUDIT_RETENTION.
+	auditPruner := audit.NewPruner(auditRepo, time.Hour, cfg.AuditRetention, logger)
+	auditPruner.Start()
+	defer auditPruner.Stop()
+
 	handler := server.New(cfg, logger, server.Deps{
 		Projects:    projectUsecase,
+		Lifecycle:   projectLifecycle,
 		Thresholds:  thresholdUsecase,
 		Metrics:     metricsUsecase,
 		Ingest:      ingestUsecase,
 		Anomalies:   anomalyUsecase,
+		Audit:       auditUsecase,
 		ProjectRepo: projectRepo,
 		RecordRepo:  recordRepo,
 		Hub:         hub,

@@ -114,4 +114,20 @@ func TestMigrateLegacySchema(t *testing.T) {
 	if alerts != 0 {
 		t.Fatal("alerts table should be dropped")
 	}
+
+	var ownerEmail string
+	if err := db.QueryRow(`SELECT owner_email FROM projects WHERE id = 'p1'`).Scan(&ownerEmail); err != nil {
+		t.Fatalf("read migrated owner_email: %v", err)
+	}
+	if ownerEmail != "" {
+		t.Fatalf("legacy project owner_email = %q, want empty string", ownerEmail)
+	}
+
+	var revoked int
+	if err := db.QueryRow(`SELECT api_key_revoked FROM projects WHERE id = 'p1'`).Scan(&revoked); err != nil {
+		t.Fatalf("read migrated api_key_revoked: %v", err)
+	}
+	if revoked != 0 {
+		t.Fatalf("legacy project api_key_revoked = %d, want 0", revoked)
+	}
 }

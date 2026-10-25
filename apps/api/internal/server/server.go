@@ -8,6 +8,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"traffic-center/anomaly"
+	"traffic-center/audit"
 	"traffic-center/domain"
 	"traffic-center/ingest"
 	"traffic-center/internal/config"
@@ -23,10 +24,12 @@ import (
 // Deps is the set of feature usecases and adapters the router needs.
 type Deps struct {
 	Projects    *project.Usecase
+	Lifecycle   *project.Lifecycle
 	Thresholds  *threshold.Usecase
 	Metrics     *metrics.Usecase
 	Ingest      *ingest.Usecase
 	Anomalies   *anomaly.Usecase
+	Audit       *audit.Usecase
 	ProjectRepo domain.ProjectRepository
 	RecordRepo  domain.RecordRepository
 	Hub         *ws.Hub
@@ -57,16 +60,18 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		ProxySecret: cfg.ProxySecret,
 		DevEmail:    cfg.DevEmail,
 		AdminEmails: cfg.AdminEmails,
+		Audit:       deps.Audit,
 	})
 
 	healthHandler := rest.NewHealthHandler()
 	identityHandler := rest.NewIdentityHandler()
-	projectHandler := rest.NewProjectHandler(deps.Projects)
-	thresholdHandler := rest.NewThresholdHandler(deps.Thresholds)
+	projectHandler := rest.NewProjectHandler(deps.Projects, deps.Lifecycle, deps.Audit)
+	thresholdHandler := rest.NewThresholdHandler(deps.Thresholds, deps.Audit)
 	metricsHandler := rest.NewMetricsHandler(deps.Projects, deps.Metrics)
 	anomalyHandler := rest.NewAnomalyHandler(deps.Projects, deps.Anomalies)
-	ingestHandler := rest.NewIngestHandler(deps.Ingest)
-	wsHandler := ws.NewHandler(deps.ProjectRepo, deps.RecordRepo, deps.Hub, cfg.MetricsWindow, cfg.AllowedOrigins, logger)
+	ingestHandler := rest.NewIngestHandler(deps.Ingest, deps.Audit)
+	auditHandler := rest.NewAuditHandler(deps.Audit)
+	wsHandler := ws.NewHandler(deps.ProjectRepo, deps.RecordRepo, deps.Hub, cfg.MetricsWindow, cfg.AllowedOrigins, logger, deps.Audit)
 
 	// Public realm: liveness and machine ingest (X-API-Key), no SSO.
 	router.Get("/health", healthHandler.Health)
@@ -80,12 +85,20 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		r.Get("/auth/me", identityHandler.Me)
 
 		r.Get("/projects", projectHandler.List)
-		r.With(middleware.RequireAdmin).Post("/projects", projectHandler.Create)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Post("/projects", projectHandler.Create)
 		r.Get("/projects/{projectID}", projectHandler.Get)
 		r.Get("/projects/{projectID}/thresholds", thresholdHandler.Get)
-		r.With(middleware.RequireAdmin).Put("/projects/{projectID}/thresholds", thresholdHandler.Update)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Put("/projects/{projectID}/thresholds", thresholdHandler.Update)
 		r.Get("/projects/{projectID}/metrics", metricsHandler.Get)
 		r.Get("/projects/{projectID}/anomalies", anomalyHandler.List)
+
+		// Admin-only key lifecycle and deletion.
+		r.With(middleware.RequireAdminWith(deps.Audit)).Post("/projects/{projectID}/api-key", projectHandler.RotateKey)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Delete("/projects/{projectID}/api-key", projectHandler.RevokeKey)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Delete("/projects/{projectID}", projectHandler.Delete)
+
+		// Admin-only audit feed (read-only; no mutation endpoints exist).
+		r.With(middleware.RequireAdminWith(deps.Audit)).Get("/audit", auditHandler.List)
 	})
 
 	// Live stream: identity at handshake, no request timeout.
