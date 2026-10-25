@@ -29,6 +29,7 @@ type Config struct {
 	WorkerInterval    time.Duration
 	DedupeWindow      time.Duration
 	SnapshotRetention time.Duration
+	AuditRetention    time.Duration
 	APITimeout        time.Duration
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
@@ -56,6 +57,7 @@ func Load() (Config, error) {
 		WorkerInterval:    envDuration("WORKER_INTERVAL", 5*time.Second),
 		DedupeWindow:      envDuration("DEDUPE_WINDOW", 60*time.Second),
 		SnapshotRetention: envDuration("SNAPSHOT_RETENTION", 7*24*time.Hour),
+		AuditRetention:    envDuration("AUDIT_RETENTION", 90*24*time.Hour),
 		APITimeout:        envDuration("API_TIMEOUT", 15*time.Second),
 		ReadHeaderTimeout: envDuration("READ_HEADER_TIMEOUT", 5*time.Second),
 		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
@@ -83,6 +85,10 @@ func Load() (Config, error) {
 
 	if cfg.Env == "production" && cfg.AuthMode == "dev" {
 		return Config{}, fmt.Errorf("AUTH_MODE=dev is not allowed when APP_ENV=production")
+	}
+
+	if cfg.Env == "production" && strings.TrimSpace(cfg.ProxySecret) == "" {
+		return Config{}, fmt.Errorf("PROXY_SHARED_SECRET is required when APP_ENV=production")
 	}
 
 	return cfg, nil

@@ -35,6 +35,14 @@
 	handle /ws/* {
 		forward_auth oauth2-proxy:4180 {
 			uri /oauth2/auth
+			# A client must never be able to assert trusted identity headers.
+			# They are stripped from the incoming request before the auth
+			# endpoint sees it; copy_headers then sets the verified values
+			# from the SSO session. If the session yields no identity, the
+			# headers stay absent and the Go API fails closed with 401.
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-User
+			header_up -X-Proxy-Secret
 			copy_headers X-Auth-Request-Email X-Auth-Request-User
 		}
 		reverse_proxy api:8080 {
@@ -48,6 +56,11 @@
 	handle /api/* {
 		forward_auth oauth2-proxy:4180 {
 			uri /oauth2/auth
+			# Same spoofing protection as /ws: identity comes only from the
+			# verified SSO session, never from the client.
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-User
+			header_up -X-Proxy-Secret
 			copy_headers X-Auth-Request-Email X-Auth-Request-User
 		}
 		reverse_proxy api:8080 {

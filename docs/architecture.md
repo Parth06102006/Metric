@@ -72,7 +72,7 @@ the host.
 4. Go's identity middleware validates the optional secret, requires an email,
    and stores a `domain.Identity` on the request context.
 5. `RequireAdmin` guards project creation and threshold updates. With an empty
-   `ADMIN_EMAILS`, every authenticated user is an admin.
+   `ADMIN_EMAILS`, nobody is an admin: the behavior is fail-closed.
 6. The handler decodes JSON, calls one usecase, and writes the result. Domain
    errors become 400/401/403/404/409/500 in `internal/httpx`.
 
@@ -305,8 +305,9 @@ control plane.
 - `proxy` — require the email header and optional secret. This is the default
   in production.
 
-`ADMIN_EMAILS` is compared case-insensitively. Empty means "all authenticated
-users are admins", which is convenient for single-team installs.
+`ADMIN_EMAILS` is compared case-insensitively. Empty means nobody is an admin:
+the behavior is fail-closed, so at least one admin must be configured before
+mutating routes become usable.
 
 ## 7. Realtime design
 

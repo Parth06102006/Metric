@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"traffic-center/audit"
 	"traffic-center/domain"
 	"traffic-center/internal/httpx"
 	"traffic-center/threshold"
@@ -13,11 +14,12 @@ import (
 // ThresholdHandler exposes threshold routes.
 type ThresholdHandler struct {
 	usecase *threshold.Usecase
+	audit   *audit.Usecase
 }
 
 // NewThresholdHandler wires the threshold handler.
-func NewThresholdHandler(usecase *threshold.Usecase) *ThresholdHandler {
-	return &ThresholdHandler{usecase: usecase}
+func NewThresholdHandler(usecase *threshold.Usecase, events *audit.Usecase) *ThresholdHandler {
+	return &ThresholdHandler{usecase: usecase, audit: events}
 }
 
 // Get handles GET /api/projects/{projectID}/thresholds.
@@ -32,16 +34,21 @@ func (h *ThresholdHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 // Update handles PUT /api/projects/{projectID}/thresholds.
 func (h *ThresholdHandler) Update(w http.ResponseWriter, r *http.Request) {
+	projectID := chi.URLParam(r, "projectID")
 	var thresholds domain.Threshold
 	if err := httpx.DecodeJSON(w, r, &thresholds); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
 
-	if err := h.usecase.Update(r.Context(), chi.URLParam(r, "projectID"), thresholds); err != nil {
+	if err := h.usecase.Update(r.Context(), projectID, thresholds); err != nil {
 		httpx.Error(w, r, err)
 		return
 	}
+
+	// Admin-only action: recorded, but never the threshold payload itself.
+	h.audit.Log(r.Context(), actor(r), domain.AuditThresholdUpdate, projectID,
+		domain.AuditOutcomeSuccess, nil)
 
 	httpx.JSON(w, http.StatusOK, thresholds)
 }

@@ -10,7 +10,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+// RepositoryProxyHelper exposes the underlying *sql.DB for integration tests
+// that need to insert raw rows (e.g. legacy projects with no owner).
+type RepositoryProxyHelper struct {
+	DB *sql.DB
+}
+
+const schemaVersion = 5
 
 // Open opens the SQLite database, applies pragmas, and runs migrations.
 func Open(path string) (*sql.DB, error) {
@@ -46,7 +52,9 @@ CREATE TABLE IF NOT EXISTS projects (
 	id TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
 	api_key_hash TEXT NOT NULL,
-	created_at INTEGER NOT NULL DEFAULT 0
+	created_at INTEGER NOT NULL DEFAULT 0,
+	owner_email TEXT NOT NULL DEFAULT '',
+	api_key_revoked INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS thresholds (
@@ -103,11 +111,43 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_project_type_detected
 	ON anomalies(project_id, type, detected_at DESC);
 `
 
+const auditTable = `
+CREATE TABLE IF NOT EXISTS audit_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts INTEGER NOT NULL,
+	actor_email TEXT NOT NULL DEFAULT '',
+	action TEXT NOT NULL,
+	target_project_id TEXT NOT NULL DEFAULT '',
+	outcome TEXT NOT NULL,
+	request_id TEXT NOT NULL DEFAULT '',
+	details_json TEXT NOT NULL DEFAULT '{}'
+);
+`
+
+const auditIndexes = `
+CREATE INDEX IF NOT EXISTS idx_audit_ts
+	ON audit_events(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action_ts
+	ON audit_events(action, ts DESC);
+`
+
 // Migrate creates the schema and upgrades the v1 layout (JSON snapshot blobs,
 // text timestamps, dead alerts table) in place.
 func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(baseSchema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
+	}
+
+	if !columnExists(db, "projects", "owner_email") {
+		if _, err := db.Exec(`ALTER TABLE projects ADD COLUMN owner_email TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add owner_email to projects: %w", err)
+		}
+	}
+
+	if !columnExists(db, "projects", "api_key_revoked") {
+		if _, err := db.Exec(`ALTER TABLE projects ADD COLUMN api_key_revoked INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add api_key_revoked to projects: %w", err)
+		}
 	}
 
 	if columnExists(db, "metric_snapshots", "data_json") {
@@ -122,7 +162,7 @@ func Migrate(db *sql.DB) error {
 		}
 	}
 
-	if _, err := db.Exec(snapshotTable + snapshotIndexes + anomalyTable + anomalyIndexes); err != nil {
+	if _, err := db.Exec(snapshotTable + snapshotIndexes + anomalyTable + anomalyIndexes + auditTable + auditIndexes); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
 

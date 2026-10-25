@@ -98,10 +98,27 @@ per-IP rate). Snapshots older than `SNAPSHOT_RETENTION` are pruned hourly.
 | `PUT` | `/api/projects/{projectID}/thresholds` | proxy identity + admin |
 | `GET` | `/api/projects/{projectID}/metrics` | proxy identity |
 | `GET` | `/api/projects/{projectID}/anomalies` | proxy identity |
+| `POST` | `/api/projects/{projectID}/api-key` | proxy identity + admin |
+| `DELETE` | `/api/projects/{projectID}/api-key` | proxy identity + admin |
+| `DELETE` | `/api/projects/{projectID}` | proxy identity + admin |
+| `GET` | `/api/audit` | proxy identity + admin |
 | `GET` | `/ws/{projectID}` | proxy identity at handshake |
 
 `GET /api/projects` and `GET .../anomalies` are additive to the original v1
 surface; the SPA needs them for the project list and anomaly history.
+
+### Security audit log
+
+`GET /api/audit` exposes an append-only, admin-only feed of security events
+(project create/delete, key rotate/revoke, threshold updates, auth and
+authorization denials including cross-user WebSocket attempts). Records carry
+the actor, action, target project, outcome, request ID, and a UTC timestamp;
+credential-shaped detail fields are redacted before storage. There are no
+endpoints that update or delete audit records. A failed audit write never
+blocks the primary operation: the event is emitted at ERROR to the structured
+application log instead, so audit gaps are possible only while the database is
+unavailable — monitor that log for `audit record write failed`. Events older
+than `AUDIT_RETENTION` are pruned hourly.
 
 ## Deploy
 
@@ -125,6 +142,10 @@ Routing:
 - `/api/*` and `/ws/*` use Caddy `forward_auth` against
   `oauth2-proxy:4180/oauth2/auth`. Caddy forwards
   `X-Auth-Request-Email`/`X-Auth-Request-User`.
+- Client-supplied `X-Auth-Request-*` and `X-Proxy-Secret` headers are stripped
+  at the edge before the auth check, so a browser or script can never assert
+  an identity; only the verified SSO session defines one. If the session
+  yields no identity, the headers stay absent and the API fails closed (401).
 - `/oauth2/*` goes to oauth2-proxy.
 - Everything else serves the built SPA with an `index.html` fallback.
 - The API verifies `X-Proxy-Secret` when `PROXY_SHARED_SECRET` is set, so the
@@ -132,6 +153,18 @@ Routing:
 
 The API and oauth2-proxy have no published ports. Caddy adds HSTS, CSP,
 `X-Content-Type-Options`, and a restrictive referrer policy.
+
+### Sessions and offboarding
+
+The session cookie is `Secure`, `HttpOnly`, `SameSite=Lax`, scoped to the site
+root, and owned entirely by oauth2-proxy — the Go API never sees it. The
+cookie lives 7 days (`cookie_expire`) and is revalidated with the identity
+provider every hour (`cookie_refresh`): a user disabled or removed at the
+provider is locked out at the next refresh or sign-in, and signing out via
+`/oauth2/sign_out` clears the session immediately. Administrator rights are
+evaluated by the Go API on every request against `ADMIN_EMAILS`, so removing
+an email from the allowlist revokes that user's API admin capabilities at
+their next request — no session changes required.
 
 ## Configuration
 
@@ -145,13 +178,14 @@ The API and oauth2-proxy have no published ports. Caddy adds HSTS, CSP,
 | `AUTH_USER_HEADER` | `X-Auth-Request-User` | trusted username header |
 | `PROXY_SHARED_SECRET` | empty | optional shared secret from Caddy |
 | `DEV_USER_EMAIL` | `dev@localhost` | injected identity in dev |
-| `ADMIN_EMAILS` | empty | comma-separated allowlist; empty means all authenticated users |
+| `ADMIN_EMAILS` | empty | comma-separated allowlist; empty means nobody is an admin (fail-closed: admin routes are denied for everyone) |
 | `TRUST_PROXY` | `true` | read `X-Forwarded-For` / `X-Real-IP` |
 | `ALLOWED_ORIGINS` | empty | extra websocket origins beyond same-host |
 | `METRICS_WINDOW` | `60s` | rolling window for live metrics |
 | `WORKER_INTERVAL` | `5s` | snapshot/detection cadence |
 | `DEDUPE_WINDOW` | `60s` | suppress repeated anomaly types |
 | `SNAPSHOT_RETENTION` | `168h` | snapshot retention |
+| `AUDIT_RETENTION` | `2160h` | audit-event retention; an hourly job prunes older rows |
 | `API_TIMEOUT` | `15s` | per-request timeout for `/api` |
 | `GEMINI_API_KEY` | empty | enables LLM explanations; fallback otherwise |
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |

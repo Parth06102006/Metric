@@ -104,6 +104,22 @@ func (h *Hub) SubscriberCount(projectID string) int {
 	return len(h.subscribers[projectID])
 }
 
+// Drop disconnects every subscriber of a project, e.g. after project deletion.
+// Clients observe their done channel closing; the handler loops exit.
+func (h *Hub) Drop(projectID string) {
+	h.mu.Lock()
+
+	subscribers, exists := h.subscribers[projectID]
+	if exists {
+		delete(h.subscribers, projectID)
+	}
+	h.mu.Unlock()
+
+	for client := range subscribers {
+		client.close()
+	}
+}
+
 // Broadcast marshals once and delivers to every subscriber of a project.
 // Slow clients are dropped rather than blocking the pipeline.
 func (h *Hub) Broadcast(projectID string, event Envelope) {

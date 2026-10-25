@@ -4,9 +4,11 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+	"time"
 
 	"traffic-center/domain"
 	"traffic-center/internal/httpx"
+	"traffic-center/internal/reqid"
 )
 
 // IdentityConfig describes how the caller identity is established.
@@ -17,6 +19,9 @@ type IdentityConfig struct {
 	ProxySecret string
 	DevEmail    string
 	AdminEmails map[string]struct{}
+	// Audit, when set, receives one auth.denied record per failed
+	// authentication. Failures never block or alter the response.
+	Audit domain.AuditSink
 }
 
 // Identity resolves the caller from trusted proxy headers.
@@ -38,6 +43,7 @@ func Identity(cfg IdentityConfig) func(http.Handler) http.Handler {
 			if cfg.ProxySecret != "" {
 				provided := r.Header.Get("X-Proxy-Secret")
 				if subtle.ConstantTimeCompare([]byte(provided), []byte(cfg.ProxySecret)) != 1 {
+					recordAuthDenied(cfg.Audit, r, "", "proxy_secret_mismatch")
 					httpx.Error(w, r, domain.ErrUnauthorized)
 					return
 				}
@@ -45,6 +51,7 @@ func Identity(cfg IdentityConfig) func(http.Handler) http.Handler {
 
 			email := strings.TrimSpace(r.Header.Get(cfg.EmailHeader))
 			if email == "" {
+				recordAuthDenied(cfg.Audit, r, "", "missing_identity_header")
 				httpx.Error(w, r, domain.ErrUnauthorized)
 				return
 			}
@@ -61,8 +68,25 @@ func Identity(cfg IdentityConfig) func(http.Handler) http.Handler {
 
 func isAdmin(admins map[string]struct{}, email string) bool {
 	if len(admins) == 0 {
-		return true
+		return false
 	}
 	_, ok := admins[strings.ToLower(email)]
 	return ok
+}
+
+// recordAuthDenied stores one failed-authentication event. Audit failures are
+// logged, never surfaced to the caller, and never block the denial.
+func recordAuthDenied(sink domain.AuditSink, r *http.Request, actorEmail, reason string) {
+	if sink == nil {
+		return
+	}
+	// The path alone is recorded: no query strings, headers, or bodies.
+	sink.Record(r.Context(), domain.AuditEvent{
+		Ts:        time.Now().UTC(),
+		ActorEmail: domain.SanitizeActor(actorEmail),
+		Action:    domain.AuditAuthDenied,
+		Outcome:   domain.AuditOutcomeFailure,
+		RequestID: reqid.From(r.Context()),
+		Details:   map[string]string{"reason": reason, "path": r.URL.Path},
+	})
 }

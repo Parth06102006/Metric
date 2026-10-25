@@ -13,6 +13,7 @@ import (
 
 	"traffic-center/domain"
 	"traffic-center/internal/httpx"
+	"traffic-center/internal/reqid"
 )
 
 const (
@@ -30,10 +31,12 @@ type Handler struct {
 	window         time.Duration
 	allowedOrigins map[string]struct{}
 	logger         *slog.Logger
+	audit          domain.AuditSink
 	upgrader       websocket.Upgrader
 }
 
-// NewHandler wires the WebSocket delivery layer.
+// NewHandler wires the WebSocket delivery layer. The audit sink is nil-safe:
+// when absent, authorization denials are not recorded.
 func NewHandler(
 	projects domain.ProjectRepository,
 	records domain.RecordRepository,
@@ -41,6 +44,7 @@ func NewHandler(
 	window time.Duration,
 	allowedOrigins map[string]struct{},
 	logger *slog.Logger,
+	audit domain.AuditSink,
 ) *Handler {
 	if window <= 0 {
 		window = 60 * time.Second
@@ -56,6 +60,7 @@ func NewHandler(
 		window:         window,
 		allowedOrigins: allowedOrigins,
 		logger:         logger,
+		audit:          audit,
 	}
 	handler.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -84,6 +89,26 @@ func (h *Handler) checkOrigin(r *http.Request) bool {
 	return allowed
 }
 
+// recordAccessDenied stores one access.denied event for an authenticated
+// caller who targeted a project they do not own. Only the actor, target,
+// outcome, request ID, and path are recorded; nothing credential-shaped and
+// nothing that would change the client-visible response. The denial itself
+// still returns 404, so the audit trail never leaks project existence.
+func (h *Handler) recordAccessDenied(r *http.Request, actorEmail, projectID string) {
+	if h.audit == nil {
+		return
+	}
+	h.audit.Record(r.Context(), domain.AuditEvent{
+		Ts:              time.Now().UTC(),
+		ActorEmail:      domain.SanitizeActor(actorEmail),
+		Action:          domain.AuditAccessDenied,
+		TargetProjectID: projectID,
+		Outcome:         domain.AuditOutcomeFailure,
+		RequestID:       reqid.From(r.Context()),
+		Details:         map[string]string{"reason": "project_access_denied", "path": r.URL.Path},
+	})
+}
+
 // ServeHTTP handles GET /ws/{projectID}.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
@@ -92,8 +117,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.projects.Get(r.Context(), projectID); err != nil {
+	p, err := h.projects.Get(r.Context(), projectID)
+	if err != nil {
 		httpx.Error(w, r, err)
+		return
+	}
+	if identity, ok := domain.IdentityFrom(r.Context()); ok && !p.CanAccess(identity) {
+		h.recordAccessDenied(r, identity.Email, projectID)
+		httpx.Error(w, r, domain.ErrNotFound)
 		return
 	}
 

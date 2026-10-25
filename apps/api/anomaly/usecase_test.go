@@ -21,6 +21,8 @@ func (f *fakeBroadcaster) BroadcastAnomaly(_ string, a domain.Anomaly) {
 	f.anomalies = append(f.anomalies, a)
 }
 
+func (f *fakeBroadcaster) Drop(string) {}
+
 type fakeExplainer struct{ calls int }
 
 func (f *fakeExplainer) Explain(context.Context, string, domain.Anomaly, domain.Snapshot) string {
