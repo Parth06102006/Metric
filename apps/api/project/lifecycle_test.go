@@ -140,3 +140,68 @@ func TestLifecycleDeleteProject(t *testing.T) {
 		t.Fatalf("Drop must not run for missing projects: %v", broadcaster.dropped)
 	}
 }
+
+func TestLifecycleAssignOwner(t *testing.T) {
+	repo := rowmemory.New()
+	usecase := project.NewUsecase(repo)
+	broadcaster := &recordingBroadcaster{}
+	lifecycle := project.NewLifecycle(repo, nil, broadcaster)
+	ctx := context.Background()
+
+	created, err := usecase.Create(ctx, "Handover")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Owner emails are normalized before storage.
+	updated, err := lifecycle.AssignOwner(ctx, created.ID, "  Alice@Example.COM ")
+	if err != nil {
+		t.Fatalf("AssignOwner: %v", err)
+	}
+	if updated.OwnerEmail != "alice@example.com" {
+		t.Fatalf("OwnerEmail = %q, want alice@example.com", updated.OwnerEmail)
+	}
+	if len(broadcaster.dropped) != 1 || broadcaster.dropped[0] != created.ID {
+		t.Fatalf("owner change must disconnect streams: %v", broadcaster.dropped)
+	}
+	if _, err := lifecycle.AssignOwner(ctx, created.ID, "ALICE@example.com"); err != nil {
+		t.Fatalf("reassign same owner: %v", err)
+	}
+	if len(broadcaster.dropped) != 1 {
+		t.Fatalf("same normalized owner must not disconnect streams: %v", broadcaster.dropped)
+	}
+
+	aliceCtx := domain.WithIdentity(ctx, domain.Identity{Email: "alice@example.com"})
+	if _, err := usecase.Get(aliceCtx, created.ID); err != nil {
+		t.Fatalf("owner cannot read assigned project: %v", err)
+	}
+
+	bobCtx := domain.WithIdentity(ctx, domain.Identity{Email: "bob@example.com"})
+	if _, err := usecase.Get(bobCtx, created.ID); !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("non-owner get = %v, want ErrAccessDenied", err)
+	}
+
+	// An empty owner makes the project admin-only again.
+	if _, err := lifecycle.AssignOwner(ctx, created.ID, ""); err != nil {
+		t.Fatalf("AssignOwner(empty): %v", err)
+	}
+	if len(broadcaster.dropped) != 2 {
+		t.Fatalf("clearing ownership must disconnect streams: %v", broadcaster.dropped)
+	}
+	if _, err := usecase.Get(aliceCtx, created.ID); !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("get after unassign = %v, want ErrAccessDenied", err)
+	}
+
+	if _, err := lifecycle.AssignOwner(ctx, created.ID, "not-an-email"); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("AssignOwner(invalid) = %v, want validation", err)
+	}
+	if _, err := lifecycle.AssignOwner(ctx, "missing", "alice@example.com"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("AssignOwner(missing) = %v, want ErrNotFound", err)
+	}
+	if _, err := lifecycle.AssignOwner(ctx, "", "alice@example.com"); !errors.Is(err, domain.ErrValidation) {
+		t.Fatalf("AssignOwner(no id) = %v, want validation", err)
+	}
+	if len(broadcaster.dropped) != 2 {
+		t.Fatalf("failed assignments must not disconnect streams: %v", broadcaster.dropped)
+	}
+}

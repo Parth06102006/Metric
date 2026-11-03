@@ -3,6 +3,7 @@ package config_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"traffic-center/internal/config"
 )
@@ -82,5 +83,28 @@ func TestConfigAdminEmailsCaseInsensitive(t *testing.T) {
 	}
 	if _, ok := cfg.AdminEmails["ops@domain.org"]; !ok {
 		t.Fatal("expected ops@domain.org to be lowercased in AdminEmails map")
+	}
+}
+
+func TestLoadAuditRetention(t *testing.T) {
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("AUDIT_RETENTION", "24h")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuditRetention != 24*time.Hour {
+		t.Fatalf("AuditRetention = %v, want 24h", cfg.AuditRetention)
+	}
+
+	// An unset value keeps the documented 90-day default.
+	t.Setenv("AUDIT_RETENTION", "")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("Load(default): %v", err)
+	}
+	if cfg.AuditRetention != 90*24*time.Hour {
+		t.Fatalf("default AuditRetention = %v, want 2160h", cfg.AuditRetention)
 	}
 }

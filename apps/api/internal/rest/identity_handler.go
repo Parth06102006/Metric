@@ -2,17 +2,18 @@ package rest
 
 import (
 	"net/http"
+	"strings"
 
 	"traffic-center/domain"
 	"traffic-center/internal/httpx"
 )
 
 // IdentityHandler exposes the current caller.
-type IdentityHandler struct{}
+type IdentityHandler struct{ projects domain.ProjectRepository }
 
 // NewIdentityHandler creates the identity handler.
-func NewIdentityHandler() *IdentityHandler {
-	return &IdentityHandler{}
+func NewIdentityHandler(projects domain.ProjectRepository) *IdentityHandler {
+	return &IdentityHandler{projects: projects}
 }
 
 type meResponse struct {
@@ -28,6 +29,17 @@ func (h *IdentityHandler) Me(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, domain.ErrUnauthorized)
 		return
 	}
+	// Only identities asserted by the trusted middleware enter the directory.
+	email := strings.ToLower(strings.TrimSpace(identity.Email))
+	if email == "" || domain.ValidateEmail(email) != nil {
+		httpx.Error(w, r, domain.ErrUnauthorized)
+		return
+	}
+	if err := h.projects.RecordUser(r.Context(), email); err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, meResponse{
 		Email: identity.Email,
 		User:  identity.User,

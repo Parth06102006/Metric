@@ -15,7 +15,7 @@ export function redirectToLogin(): void {
   window.location.assign(`/oauth2/start?rd=${returnTo}`);
 }
 
-async function request<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
+async function perform(path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
@@ -41,7 +41,17 @@ async function request<T>(path: string, schema: z.ZodType<T>, init?: RequestInit
     throw new ApiError(response.status, message);
   }
 
+  return response;
+}
+
+async function request<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
+  const response = await perform(path, init);
   return schema.parse(await response.json());
 }
 
-export { request };
+/** For endpoints that answer with 204 and no body. */
+async function requestNoContent(path: string, init?: RequestInit): Promise<void> {
+  await perform(path, init);
+}
+
+export { request, requestNoContent };

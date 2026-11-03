@@ -48,8 +48,24 @@ func (r *Repository) Range(ctx context.Context, projectID string, from, to time.
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return readSnapshots(rows)
+}
 
+// Recent limits the newest rows before returning them in chronological order.
+func (r *Repository) Recent(ctx context.Context, projectID string, limit int) ([]domain.Snapshot, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT ts, window_s, rps, p50, p95, p99, error_rate, unique_ips, top_ip_rps, avg_payload_bytes, endpoints_json
+		 FROM (SELECT * FROM metric_snapshots WHERE project_id = ? ORDER BY ts DESC, id DESC LIMIT ?)
+		 ORDER BY ts ASC, id ASC`, projectID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return readSnapshots(rows)
+}
+
+func readSnapshots(rows *sql.Rows) ([]domain.Snapshot, error) {
+	defer func() { _ = rows.Close() }()
 	snapshots := make([]domain.Snapshot, 0)
 	for rows.Next() {
 		var (

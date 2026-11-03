@@ -71,9 +71,16 @@ the host.
    `X-Proxy-Secret`.
 4. Go's identity middleware validates the optional secret, requires an email,
    and stores a `domain.Identity` on the request context.
-5. `RequireAdmin` guards project creation and threshold updates. With an empty
-   `ADMIN_EMAILS`, nobody is an admin: the behavior is fail-closed.
-6. The handler decodes JSON, calls one usecase, and writes the result. Domain
+5. Routes that mutate or expose cross-tenant material add `RequireAdmin`:
+   project creation, owner assignment, key rotate/revoke, threshold updates,
+   project deletion, and the audit feed. With an empty `ADMIN_EMAILS`, nobody is
+   an admin: the behavior is fail-closed.
+6. Project-scoped reads check `project.CanAccess(identity)` in the usecase. A
+   caller who is not the owner and not an admin gets `domain.ErrAccessDenied`,
+   which delivery maps to the same 404 as a missing project, so responses never
+   reveal whether a project exists. The handler still records an
+   `access.denied` audit event.
+7. The handler decodes JSON, calls one usecase, and writes the result. Domain
    errors become 400/401/403/404/409/500 in `internal/httpx`.
 
 ### Ingest — `/ingest/{projectID}`
@@ -91,12 +98,17 @@ the host.
 
 1. Caddy authenticates the handshake exactly like `/api`, then proxies with
    `flush_interval -1`.
-2. The Go handler checks the project exists, upgrades the connection, and
-   registers a subscriber with the hub.
+2. The Go handler checks the caller is an owner, viewer, or admin. An unauthorized
+   handshake gets the same 404 as a missing project. After upgrading, it rechecks
+   access before registration to close a race with access changes or deletion.
 3. It immediately writes a snapshot computed from the current window, then
-   forwards hub messages until the client disconnects or its read deadline
-   expires.
-4. The hub sends a ping every 30 seconds; the read deadline is 60 seconds.
+   forwards hub messages until the client disconnects, its read deadline
+   expires, access changes, or the project is deleted. Ownership changes and
+   viewer removals disconnect all subscribers; authorized clients may reconnect.
+4. A process-local stream fence coordinates registration and writes with access
+   changes and deletion. These mutations may wait for an in-progress WebSocket
+   write (up to its 5-second deadline); this is not a multi-process fence.
+5. The hub sends a ping every 30 seconds; the read deadline is 60 seconds.
 
 Origin policy: same-host handshakes are allowed (Caddy preserves `Host`), as are
 hosts listed in `ALLOWED_ORIGINS`. A missing `Origin` is allowed for non-browser
@@ -119,14 +131,17 @@ metrics.Usecase.Current()  ──▶ domain.Compute(records, window)
                  ├── ThresholdRepository.Get() (defaults when absent)
                  ├── domain.Detect(snapshot, thresholds)
                  ├── AnomalyRepository.HasRecent(type, dedupe window)
-                 ├── Explainer.Explain() (Gemini or deterministic fallback)
-                 ├── AnomalyRepository.Save()
+                 ├── save rule-based anomaly + bounded job transactionally
                  └── Hub.BroadcastAnomaly()
+                            │
+                            ▼
+                background worker → Jev → save advisory result → broadcast update
 ```
 
 Snapshots older than `SNAPSHOT_RETENTION` are pruned at most once an hour.
 `ActiveProjects` also drops projects whose live window is empty, so idle
-projects stop generating rows.
+projects stop generating rows. A separate hourly job prunes audit events older
+than `AUDIT_RETENTION`.
 
 ## 4. Backend structure
 
@@ -137,7 +152,8 @@ apps/api/
     project.go threshold.go metric.go anomaly.go identity.go
     ports.go errors.go ids.go
   project/
-    usecase.go
+    usecase.go                 read/create with ownership checks
+    lifecycle.go               rotate/revoke/delete/assign owner
     repository/memory/
     repository/sqlite/
   threshold/
@@ -149,8 +165,12 @@ apps/api/
     repository/sqlite/         snapshots
   ingest/usecase.go
   anomaly/
-    usecase.go                 evaluate + dedupe + explain + publish
+    usecase.go                 evaluate + dedupe + queue + publish
     worker.go                  periodic pipeline
+    repository/{memory,sqlite}/
+  audit/
+    usecase.go                 record (redacted) + filtered reads
+    pruner.go                  hourly retention job
     repository/{memory,sqlite}/
   internal/
     config/                    env parsing and production guards
@@ -160,7 +180,8 @@ apps/api/
                                identity, admin, timeout
     rest/                      HTTP handlers per feature
     ws/                        hub + websocket handler
-    llm/                       Gemini explainer with fallback
+    jev/                       Jev structured incident analysis via OpenRouter
+    analysis/                  durable background job worker
     sqlite/                    connection, pragmas, schema migration
     server/                    chi route map and middleware wiring
 ```
@@ -169,7 +190,7 @@ apps/api/
 
 `domain` imports only the standard library. Feature usecases import `domain`
 and define behaviour in terms of its ports. Adapters (`repository/*`,
-`internal/llm`, `internal/ws`) implement those ports. Delivery
+`internal/ws`) implement those ports. Delivery
 (`internal/rest`) depends on usecases, never on repositories. The composition
 root is the only place that knows every concrete type.
 
@@ -189,6 +210,28 @@ keeps feature modules independent.
 - `domain.HashAPIKey` uses SHA-256. Keys are 32 random bytes rendered as hex;
   there is no low-entropy secret to brute-force.
 - Project IDs are 8 random bytes (16 hex characters).
+- `domain.ValidateEmail` shape-checks owner emails (empty means no owner) and
+  `domain.SanitizeActor` lowercases/normalizes every recorded actor.
+
+### Audit log
+
+`domain.AuditEvent` is the single record shape: id, UTC timestamp, actor email,
+action, target project, outcome, request ID, and a string map of curated
+details. Actions are constants (`project.create`, `project.owner.assign`,
+`api_key.rotate`, `access.denied`, …) so the feed stays filterable and no
+handler invents free-form strings.
+
+- Write path: `domain.AuditSink` is the minimal port. `audit.Usecase` implements
+  it, redacts credential-shaped detail keys (`domain.RedactDetails`), stamps the
+  request ID, and logs a write failure at ERROR without failing the request. A
+  nil sink is a no-op, so delivery never depends on the audit subsystem being
+  wired.
+- Read path: `AuditRepository.List` takes `domain.AuditQuery` (limit, action,
+  project, composite `before`/`before_id` cursor). The usecase clamps the limit;
+  the REST handler validates the cursor and returns 400 on malformed input.
+- Retention: `audit.Pruner` deletes rows older than `AUDIT_RETENTION` at most
+  once an hour. There is intentionally no HTTP route that updates or deletes
+  audit rows.
 
 ### Delivery middleware
 
@@ -218,7 +261,9 @@ projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   api_key_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  owner_email TEXT NOT NULL DEFAULT '',      -- '' = no owner (viewers may be granted separately)
+  api_key_revoked INTEGER NOT NULL DEFAULT 0 -- 1 rejects ingest until rotation
 )
 
 thresholds (
@@ -254,6 +299,18 @@ anomalies (
 )
 -- indexes: (project_id, detected_at DESC),
 --          (project_id, type, detected_at DESC)
+
+audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,                 -- unix milliseconds
+  actor_email TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  target_project_id TEXT NOT NULL DEFAULT '',
+  outcome TEXT NOT NULL,               -- success | failure
+  request_id TEXT NOT NULL DEFAULT '',
+  details_json TEXT NOT NULL DEFAULT '{}'
+)
+-- indexes: (ts DESC), (action, ts DESC)
 ```
 
 `endpoints_json` is the only embedded document left: it is a variable-size map
@@ -265,13 +322,19 @@ column.
 `internal/sqlite.Migrate` runs on startup and is idempotent:
 
 1. Create `projects` and `thresholds` if absent.
-2. If `metric_snapshots` has a `data_json` column, read the legacy rows, rename
+2. Add `owner_email` and `api_key_revoked` to an existing `projects` table.
+   Existing rows default to `''` and `0`, so pre-ownership projects stay
+   admin-only until an owner is assigned.
+3. If `metric_snapshots` has a `data_json` column, read the legacy rows, rename
    the table to `metric_snapshots_legacy_v1`, create the typed table, and copy
    parsed values.
-3. If `anomalies` has `summary` and no `type`, do the same into
+4. If `anomalies` has `summary` and no `type`, do the same into
    `anomalies_legacy_v1`, splitting `"type: message"` summaries.
-4. Drop the unused `alerts` table.
-5. Set `PRAGMA user_version = 2`.
+5. Create the snapshot, anomaly, and audit tables with their indexes.
+6. Drop the unused `alerts` table.
+7. Add diagnosis fields and durable analysis jobs.
+8. Add the authenticated user directory and view-only project memberships; set
+   `PRAGMA user_version = 7`.
 
 Legacy tables are retained for inspection but are not read by the application.
 
@@ -309,6 +372,13 @@ control plane.
 the behavior is fail-closed, so at least one admin must be configured before
 mutating routes become usable.
 
+Project-level authorization is separate from admin rights. `project.CanAccess`
+grants access to the owner, explicitly granted viewers, or an admin. Viewer
+membership is independent of the existing owner, so clearing an owner does not
+remove viewers. Unauthorized reads return 404 rather than 403, and each denial
+is recorded as `access.denied`. The admin-only known-user directory is populated
+only after trusted identity reaches `/api/auth/me`, not from arbitrary input.
+
 ## 7. Realtime design
 
 Envelope:
@@ -343,19 +413,29 @@ so long-lived websockets are not cut off.
 
 ```text
 src/
-  app.tsx                    routes: / and /p/:projectId
+  app.tsx                    routes: /, /p/:projectId, /audit
   main.tsx                   QueryClient + BrowserRouter
   types/api.ts               zod schemas mirroring Go JSON
-  lib/api.ts                 typed fetch, 401 → /oauth2/start
+  lib/api.ts                 typed fetch, 204 handling, 401 → /oauth2/start
   lib/live-store.ts          ring buffer + useSyncExternalStore
   lib/query.ts               TanStack Query defaults
-  features/projects|thresholds|metrics/  REST clients
-  features/live/connection.ts            reconnecting websocket
-  components/charts/TimeSeries.tsx       uPlot lifecycle
-  components/layout/AppShell.tsx         shell + identity
+  features/identity/         /api/auth/me + shared useMe() hook
+  features/projects/         project lifecycle REST clients
+  features/thresholds|metrics/  REST clients
+  features/audit/            audit feed client + query builder
+  features/live/connection.ts    reconnecting websocket
+  components/charts/TimeSeries.tsx  uPlot lifecycle
+  components/layout/AppShell.tsx    shell, identity, admin nav
   routes/Dashboard.tsx
   routes/ProjectDetail.tsx
+  routes/AuditLog.tsx
 ```
+
+Admin-only surfaces are hidden, not just disabled: the dashboard drops the
+"New project" control, the project page only renders the key/ownership/delete
+cards for admins, and the audit route explains that it is restricted instead of
+fetching (the API would answer 403). The server remains the authority for every
+one of these actions.
 
 ### Two data lanes
 
@@ -402,30 +482,56 @@ docker compose
 
 - **Single writer.** SQLite plus a process-local hub means one API instance.
   Scaling out requires a shared store and a pub/sub bus.
-- **Synchronous explanation.** The worker calls the explainer inline; a Gemini
-  call can add up to 4 seconds to a tick. The per-project rate limit (one call
-  per 60s) and the deterministic fallback bound the damage. A queue would be
-  the next step.
+- **Asynchronous advisory analysis.** With an OpenRouter key, a bounded SQLite
+  queue and one background goroutine enrich persisted alerts using Jev. Jobs are leased,
+  retried at most three times and can be replayed after a crash; a provider
+  call may be billed again if a crash happens before the result is committed.
+  Queue-full and failed cases preserve the rule-based alert. Without a key,
+  no jobs are created or processed; existing pending jobs resume when the key
+  is restored. The provider receives aggregate metrics and anonymized endpoint
+  summaries, not IPs or paths. Completed diagnoses retain that evidence.
+  Baseline snapshots are selected before the incident window and summarized
+  using medians; their time span does not guarantee continuous coverage.
+  Suggestions require a baseline, at least 20 requests and a model evidence
+  probability of 0.7; these initial gates are heuristics, not measured accuracy.
+  The 30-second attempt limit is per process and is not a spending cap.
 - **Memory window is per process.** A restart loses up to one window of raw
   requests, so the first snapshot after restart may be sparse.
 - **Dedupe is per anomaly type.** A project can have at most one alert of each
   type per `DEDUPE_WINDOW`, regardless of severity changes.
-- **No HTTP history endpoint yet.** `SnapshotRepository.Range` and
-  `metrics.Usecase.History` exist, but the SPA currently builds history from
-  the live stream. Adding `GET /api/projects/{id}/metrics/history` is small.
-- **Anomaly list is capped** at 100 by default (1000 maximum) and is not
-  paginated.
-- **LLM output is untrusted text.** It is rendered as text, not HTML.
+- **Graph history is bounded to the newest 900 snapshots.** The SPA restores
+  this series from `GET /api/projects/{id}/metrics/history` on load and after
+  reconnect, then merges it with the live stream. `SnapshotRepository.Range`
+  remains the time-range query used by analysis.
+- **Anomaly API results are capped** at 100 by default (1000 maximum); the
+  dashboard paginates only the loaded recent 100, not the full historical set.
+- **Audit writes are best-effort.** If the database is unavailable, the event is
+  written to the structured log instead and the primary request still succeeds.
+  Monitor `audit record write failed` for gaps.
+- **Audit reads are exact-match.** Action, project, limit, and a composite cursor
+  are supported; there is no full-text search over details.
+- **Identity is email-based.** The local directory records emails observed at
+  trusted sign-in, not a full identity-provider directory. Renaming an account
+  requires updating ownership and viewer membership.
+- **Model output is advisory.** Closed-set answers are validated, and confidence
+  is not proof of correctness. The narrative is rendered as text, not HTML.
 
 ## 11. Testing
 
 - `domain` — compute and detection are pure and table-testable.
-- Feature usecases — memory repositories stand in for SQLite.
+- Feature usecases — memory repositories stand in for SQLite, including the
+  audit adapter used by its usecase and pruner tests.
+- `audit` — redaction, non-blocking write failure, limit clamping, and
+  action/project/cursor filters.
 - Middleware — dev injection, proxy header requirement, shared secret, admin
-  gate.
-- `internal/sqlite` — migrates a synthetic v1 schema and verifies copied rows.
+  gate, fail-closed empty admin list.
+- `internal/sqlite` — migrates a synthetic v1 schema and verifies copied rows,
+  ownership defaults, and revocation defaults.
 - `internal/server` — full HTTP lifecycle over `httptest`: create, ingest,
-  metrics, thresholds, anomalies, auth, 404/405, websocket initial snapshot.
+  metrics, thresholds, anomalies, ownership assignment, key rotate/revoke,
+  deletion, audit filters and cursor validation, auth, 404/405, websocket
+  initial snapshot, cross-user REST/WebSocket denials, and stream shutdown on
+  delete.
 - `internal/ws` — concurrent register/broadcast/unregister under `-race`.
 
 ```bash

@@ -53,6 +53,9 @@ type Snapshot struct {
 	TopIPRPS        float64        `json:"top_ip_rps"`
 	AvgPayloadBytes float64        `json:"avg_payload_bytes"`
 	Endpoints       map[string]int `json:"endpoints"`
+	// Transient evidence for analysis jobs, not part of the snapshot API or history.
+	SampleCount     *int              `json:"-"`
+	EndpointSummary *EndpointEvidence `json:"-"`
 }
 
 // Compute calculates a snapshot using the current time.
@@ -77,10 +80,24 @@ func ComputeAt(records []LogRecord, windowSeconds int, now time.Time) Snapshot {
 
 	var errorCount int
 	var totalPayloadBytes int64
+	type endpointStats struct {
+		latencies []float64
+		errors    int
+	}
+	endpointData := make(map[string]*endpointStats)
 
 	for _, record := range records {
 		latencies = append(latencies, record.LatencyMs)
 		result.Endpoints[record.Endpoint]++
+		stats := endpointData[record.Endpoint]
+		if stats == nil {
+			stats = &endpointStats{}
+			endpointData[record.Endpoint] = stats
+		}
+		stats.latencies = append(stats.latencies, record.LatencyMs)
+		if record.Status >= 500 {
+			stats.errors++
+		}
 		ips[record.IP]++
 		totalPayloadBytes += int64(record.PayloadBytes)
 
@@ -88,6 +105,24 @@ func ComputeAt(records []LogRecord, windowSeconds int, now time.Time) Snapshot {
 			errorCount++
 		}
 	}
+
+	count := len(records)
+	result.SampleCount = &count
+	summary := &EndpointEvidence{EndpointCount: len(endpointData)}
+	for _, stats := range endpointData {
+		if stats.errors > 0 {
+			summary.EndpointsWithErrors++
+		}
+		if stats.errors > summary.MostErrors || (stats.errors == summary.MostErrors && len(stats.latencies) > summary.MostErrorsSamples) {
+			summary.MostErrors, summary.MostErrorsSamples = stats.errors, len(stats.latencies)
+		}
+		sort.Float64s(stats.latencies)
+		p95 := percentile(stats.latencies, 0.95)
+		if p95 > summary.SlowestP95 || (p95 == summary.SlowestP95 && len(stats.latencies) > summary.SlowestP95Samples) {
+			summary.SlowestP95, summary.SlowestP95Samples = p95, len(stats.latencies)
+		}
+	}
+	result.EndpointSummary = summary
 
 	result.RPS = float64(len(records)) / float64(windowSeconds)
 	result.ErrorRate = float64(errorCount) * 100 / float64(len(records))

@@ -57,6 +57,9 @@ func (c *Client) Done() <-chan struct{} {
 
 // Hub fans out events to subscribers grouped by project.
 type Hub struct {
+	// Serializes ownership/deletion changes against subscription registration
+	// and outbound writes, so a revoked subscriber cannot receive later events.
+	accessMu    sync.RWMutex
 	mu          sync.RWMutex
 	subscribers map[string]map[*Client]struct{}
 }
@@ -65,6 +68,13 @@ type Hub struct {
 func NewHub() *Hub {
 	return &Hub{subscribers: make(map[string]map[*Client]struct{})}
 }
+
+// LockStreamAccess fences subscription changes and writes while project
+// ownership or existence changes. Callers must release it promptly.
+func (h *Hub) LockStreamAccess() { h.accessMu.Lock() }
+
+// UnlockStreamAccess releases the project stream access fence.
+func (h *Hub) UnlockStreamAccess() { h.accessMu.Unlock() }
 
 // Register adds a client and returns it.
 func (h *Hub) Register(projectID string) *Client {

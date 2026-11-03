@@ -47,6 +47,10 @@ func (r *Repository) Get(ctx context.Context, projectID string) (domain.Project,
 	if err != nil {
 		return domain.Project{}, err
 	}
+	project.Viewers, err = r.ListMembers(ctx, projectID)
+	if err != nil {
+		return domain.Project{}, err
+	}
 	return project, nil
 }
 
@@ -55,7 +59,7 @@ func (r *Repository) List(ctx context.Context) ([]domain.Project, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	projects := make([]domain.Project, 0)
 	for rows.Next() {
@@ -70,13 +74,16 @@ func (r *Repository) List(ctx context.Context) ([]domain.Project, error) {
 
 func (r *Repository) ListByOwner(ctx context.Context, ownerEmail string) ([]domain.Project, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, name, owner_email FROM projects WHERE lower(owner_email) = lower(?) ORDER BY name ASC`,
-		ownerEmail,
+		`SELECT id, name, owner_email FROM projects p
+		 WHERE lower(owner_email) = lower(?) OR EXISTS (
+		   SELECT 1 FROM project_viewers v WHERE v.project_id = p.id AND v.email = ? COLLATE NOCASE
+		 ) ORDER BY name ASC`,
+		ownerEmail, ownerEmail,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	projects := make([]domain.Project, 0)
 	for rows.Next() {
@@ -87,6 +94,75 @@ func (r *Repository) ListByOwner(ctx context.Context, ownerEmail string) ([]doma
 		projects = append(projects, project)
 	}
 	return projects, rows.Err()
+}
+
+// RecordUser is called only after the trusted identity middleware succeeds.
+func (r *Repository) RecordUser(ctx context.Context, email string) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO known_users(email) VALUES (?) ON CONFLICT(email) DO NOTHING`, email)
+	return err
+}
+
+func (r *Repository) ListUsers(ctx context.Context) ([]string, error) {
+	return r.strings(ctx, `SELECT email FROM known_users ORDER BY email COLLATE NOCASE`)
+}
+
+func (r *Repository) ListMembers(ctx context.Context, projectID string) ([]string, error) {
+	return r.strings(ctx, `SELECT email FROM project_viewers WHERE project_id = ? ORDER BY email COLLATE NOCASE`, projectID)
+}
+
+func (r *Repository) strings(ctx context.Context, query string, args ...any) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	values := make([]string, 0)
+	for rows.Next() {
+		var value string
+		if err := rows.Scan(&value); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
+func (r *Repository) AddMember(ctx context.Context, projectID, email string) error {
+	// Both existence checks are part of the same write, avoiding a race with
+	// deletion and ensuring only identities observed at sign-in can be added.
+	result, err := r.db.ExecContext(ctx, `INSERT INTO project_viewers(project_id, email)
+	 SELECT p.id, u.email FROM projects p JOIN known_users u ON u.email = ? COLLATE NOCASE
+	 WHERE p.id = ? ON CONFLICT(project_id, email) DO NOTHING`, email, projectID)
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		var found int
+		if err := r.db.QueryRowContext(ctx, `SELECT count(*) FROM project_viewers WHERE project_id = ? AND email = ? COLLATE NOCASE`, projectID, email).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			return domain.ErrNotFound
+		}
+	}
+	return nil
+}
+
+func (r *Repository) RemoveMember(ctx context.Context, projectID, email string) error {
+	result, err := r.db.ExecContext(ctx, `DELETE FROM project_viewers WHERE project_id = ? AND email = ? COLLATE NOCASE`, projectID, email)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
 }
 
 // Authenticate compares the presented key against the stored hash in constant
@@ -144,6 +220,20 @@ func (r *Repository) RevokeKey(ctx context.Context, projectID string) error {
 	return nil
 }
 
+// SetOwner assigns or clears the project owner.
+func (r *Repository) SetOwner(ctx context.Context, projectID, ownerEmail string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE projects SET owner_email = ? WHERE id = ?`, ownerEmail, projectID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
 // Delete removes the project and its dependent data in one transaction.
 // Thresholds also cascade by foreign key, but the explicit deletes do not
 // rely on that pragma being honoured by every connection.
@@ -152,9 +242,10 @@ func (r *Repository) Delete(ctx context.Context, projectID string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
 
 	for _, statement := range []string{
+		`DELETE FROM project_viewers WHERE project_id = ?`,
 		`DELETE FROM thresholds WHERE project_id = ?`,
 		`DELETE FROM metric_snapshots WHERE project_id = ?`,
 		`DELETE FROM anomalies WHERE project_id = ?`,

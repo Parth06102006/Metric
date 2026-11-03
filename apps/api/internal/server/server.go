@@ -64,11 +64,11 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 	})
 
 	healthHandler := rest.NewHealthHandler()
-	identityHandler := rest.NewIdentityHandler()
+	identityHandler := rest.NewIdentityHandler(deps.ProjectRepo)
 	projectHandler := rest.NewProjectHandler(deps.Projects, deps.Lifecycle, deps.Audit)
 	thresholdHandler := rest.NewThresholdHandler(deps.Thresholds, deps.Audit)
-	metricsHandler := rest.NewMetricsHandler(deps.Projects, deps.Metrics)
-	anomalyHandler := rest.NewAnomalyHandler(deps.Projects, deps.Anomalies)
+	metricsHandler := rest.NewMetricsHandler(deps.Projects, deps.Metrics, deps.Audit)
+	anomalyHandler := rest.NewAnomalyHandler(deps.Projects, deps.Anomalies, deps.Audit)
 	ingestHandler := rest.NewIngestHandler(deps.Ingest, deps.Audit)
 	auditHandler := rest.NewAuditHandler(deps.Audit)
 	wsHandler := ws.NewHandler(deps.ProjectRepo, deps.RecordRepo, deps.Hub, cfg.MetricsWindow, cfg.AllowedOrigins, logger, deps.Audit)
@@ -83,6 +83,7 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		r.Use(middleware.Timeout(cfg.APITimeout))
 
 		r.Get("/auth/me", identityHandler.Me)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Get("/users", projectHandler.KnownUsers)
 
 		r.Get("/projects", projectHandler.List)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Post("/projects", projectHandler.Create)
@@ -90,9 +91,16 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		r.Get("/projects/{projectID}/thresholds", thresholdHandler.Get)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Put("/projects/{projectID}/thresholds", thresholdHandler.Update)
 		r.Get("/projects/{projectID}/metrics", metricsHandler.Get)
+		r.Get("/projects/{projectID}/metrics/history", metricsHandler.History)
 		r.Get("/projects/{projectID}/anomalies", anomalyHandler.List)
 
-		// Admin-only key lifecycle and deletion.
+		// Admin-only project viewer management.
+		r.With(middleware.RequireAdminWith(deps.Audit)).Get("/projects/{projectID}/viewers", projectHandler.Viewers)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Post("/projects/{projectID}/viewers", projectHandler.AddViewer)
+		r.With(middleware.RequireAdminWith(deps.Audit)).Delete("/projects/{projectID}/viewers", projectHandler.RemoveViewer)
+
+		// Admin-only ownership, key lifecycle, and deletion.
+		r.With(middleware.RequireAdminWith(deps.Audit)).Patch("/projects/{projectID}", projectHandler.AssignOwner)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Post("/projects/{projectID}/api-key", projectHandler.RotateKey)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Delete("/projects/{projectID}/api-key", projectHandler.RevokeKey)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Delete("/projects/{projectID}", projectHandler.Delete)

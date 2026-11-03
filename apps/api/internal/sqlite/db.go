@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,32 +18,60 @@ type RepositoryProxyHelper struct {
 	DB *sql.DB
 }
 
-const schemaVersion = 5
+const schemaVersion = 7
+const maxOpenConnections = 10
+
+var memoryDatabaseID atomic.Uint64
 
 // Open opens the SQLite database, applies pragmas, and runs migrations.
 func Open(path string) (*sql.DB, error) {
-	var dsn string
-	switch {
-	case path == ":memory:":
-		dsn = "file::memory:?cache=shared&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
-	case strings.Contains(path, "?"):
-		dsn = path
-	default:
-		dsn = path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)"
+	base, query, customDSN := strings.Cut(path, "?")
+	params, err := url.ParseQuery(query)
+	if err != nil {
+		return nil, fmt.Errorf("invalid SQLite DSN: %w", err)
 	}
+	if path == ":memory:" {
+		// Each Open gets an isolated database shared by its own pooled connections.
+		base = fmt.Sprintf("file:/metric-memory-%d", memoryDatabaseID.Add(1))
+		params.Set("vfs", "memdb")
+	}
+	// Connection-local settings must be applied by the driver to every pooled
+	// connection, not just once through db.Exec.
+	params.Set("_foreign_keys", "1")
+	if params.Get("_busy_timeout") == "" && params.Get("_timeout") == "" {
+		hasBusyPragma := false
+		for _, pragma := range params["_pragma"] {
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(pragma)), "busy_timeout") {
+				hasBusyPragma = true
+			}
+		}
+		if !hasBusyPragma {
+			params.Set("_busy_timeout", "5000")
+		}
+	}
+	if !customDSN && path != ":memory:" {
+		params.Add("_pragma", "journal_mode(WAL)")
+		params.Add("_pragma", "synchronous(NORMAL)")
+	}
+	// All current explicit transactions write. Reserve SQLite's single writer
+	// before reading so concurrent read-then-write transactions do not fail
+	// on lock upgrades or race queue capacity/lease claims.
+	params.Set("_txlock", "immediate")
+	dsn := base + "?" + params.Encode()
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(maxOpenConnections)
+	db.SetMaxIdleConns(maxOpenConnections)
 
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if err := Migrate(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
@@ -65,6 +95,20 @@ CREATE TABLE IF NOT EXISTS thresholds (
 	req_per_ip_max REAL NOT NULL DEFAULT 30,
 	FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
+`
+
+// The directory is populated only by authenticated identities. Membership is
+// separate from the existing owner so upgrading preserves ownership semantics.
+const membersSchema = `
+CREATE TABLE IF NOT EXISTS known_users (
+  email TEXT PRIMARY KEY COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS project_viewers (
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  email TEXT NOT NULL COLLATE NOCASE REFERENCES known_users(email),
+  PRIMARY KEY(project_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_project_viewers_email ON project_viewers(email);
 `
 
 const snapshotTable = `
@@ -109,6 +153,21 @@ CREATE INDEX IF NOT EXISTS idx_anomalies_project_detected
 	ON anomalies(project_id, detected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_anomalies_project_type_detected
 	ON anomalies(project_id, type, detected_at DESC);
+`
+
+const analysisJobsSchema = `
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+  anomaly_id INTEGER PRIMARY KEY REFERENCES anomalies(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  state_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_ready ON analysis_jobs(status, next_attempt, lease_until);
 `
 
 const auditTable = `
@@ -165,6 +224,22 @@ func Migrate(db *sql.DB) error {
 	if _, err := db.Exec(snapshotTable + snapshotIndexes + anomalyTable + anomalyIndexes + auditTable + auditIndexes); err != nil {
 		return fmt.Errorf("schema: %w", err)
 	}
+	if !columnExists(db, "anomalies", "diagnosis_json") {
+		if _, err := db.Exec(`ALTER TABLE anomalies ADD COLUMN diagnosis_json TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add diagnosis_json: %w", err)
+		}
+	}
+	if !columnExists(db, "anomalies", "analysis_status") {
+		if _, err := db.Exec(`ALTER TABLE anomalies ADD COLUMN analysis_status TEXT NOT NULL DEFAULT 'disabled'`); err != nil {
+			return fmt.Errorf("add analysis_status: %w", err)
+		}
+	}
+	if _, err := db.Exec(analysisJobsSchema); err != nil {
+		return fmt.Errorf("analysis jobs schema: %w", err)
+	}
+	if _, err := db.Exec(membersSchema); err != nil {
+		return fmt.Errorf("members schema: %w", err)
+	}
 
 	// The alerts table was never written to; drop it rather than carry dead schema.
 	_, _ = db.Exec(`DROP TABLE IF EXISTS alerts`)
@@ -202,12 +277,14 @@ func migrateSnapshots(db *sql.DB) error {
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.projectID, &r.createdAt, &r.data); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		legacy = append(legacy, r)
 	}
-	rows.Close()
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
@@ -216,7 +293,7 @@ func migrateSnapshots(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
 
 	if _, err := tx.Exec(`ALTER TABLE metric_snapshots RENAME TO metric_snapshots_legacy_v1`); err != nil {
 		return err
@@ -268,12 +345,14 @@ func migrateAnomalies(db *sql.DB) error {
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.projectID, &r.createdAt, &r.severity, &r.summary, &r.analysis); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		legacy = append(legacy, r)
 	}
-	rows.Close()
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
@@ -282,7 +361,7 @@ func migrateAnomalies(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
 
 	if _, err := tx.Exec(`ALTER TABLE anomalies RENAME TO anomalies_legacy_v1`); err != nil {
 		return err
@@ -321,7 +400,7 @@ func columnExists(db *sql.DB, table, column string) bool {
 	if err != nil {
 		return false
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var (

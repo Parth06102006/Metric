@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -205,6 +207,9 @@ func TestProjectLifecycle(t *testing.T) {
 	}
 
 	response, body = doJSON(t, http.MethodGet, server.URL+"/api/projects/"+project.ProjectID+"/thresholds", nil, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("get updated thresholds status = %d, body = %s", response.StatusCode, body)
+	}
 	if err := json.Unmarshal(body, &thresholds); err != nil {
 		t.Fatalf("decode thresholds: %v", err)
 	}
@@ -323,6 +328,11 @@ func TestMethodNotAllowed(t *testing.T) {
 
 func newProxyTestServer(t *testing.T, adminEmails []string) (*httptest.Server, *sqlite.RepositoryProxyHelper) {
 	t.Helper()
+	return newProxyTestServerWithConfig(t, adminEmails, nil)
+}
+
+func newProxyTestServerWithConfig(t *testing.T, adminEmails []string, configure func(*config.Config)) (*httptest.Server, *sqlite.RepositoryProxyHelper) {
+	t.Helper()
 
 	db, err := sqlite.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -359,6 +369,9 @@ func newProxyTestServer(t *testing.T, adminEmails []string) (*httptest.Server, *
 		AdminEmails:     adminsMap,
 		AllowedOrigins:  map[string]struct{}{},
 	}
+	if configure != nil {
+		configure(&cfg)
+	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	auditUsecase := audit.NewUsecase(auditsqlite.New(db), logger)
@@ -388,8 +401,8 @@ func TestProjectOwnershipAndAuthorization(t *testing.T) {
 	headersAdmin := map[string]string{"X-Auth-Request-Email": "admin@example.com"}
 	updatedThreshold := domain.Threshold{P95Ms: 500, ErrorRate: 1, RPSMax: 50, ReqPerIPMax: 10}
 
-	// Setup: Admin creates Project B and assigns owner_email = "bob@example.com" via DB.
-	// (Project creation is admin-only; ownership is recorded on the project row.)
+	// Setup: Admin creates Project B and assigns it to Bob through the
+	// admin-only ownership route.
 	resp, body := doJSON(t, http.MethodPost, server.URL+"/api/projects", map[string]string{"name": "Bob Project"}, headersAdmin)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create project B status = %d, body = %s", resp.StatusCode, body)
@@ -398,9 +411,26 @@ func TestProjectOwnershipAndAuthorization(t *testing.T) {
 	if err := json.Unmarshal(body, &projectB); err != nil {
 		t.Fatalf("decode project B: %v", err)
 	}
-	// Re-assign owner to Bob (simulates the admin creating a project for a user)
-	if _, err := helper.DB.Exec(`UPDATE projects SET owner_email = 'bob@example.com' WHERE id = ?`, projectB.ProjectID); err != nil {
-		t.Fatalf("assign project to Bob: %v", err)
+	resp, body = doJSON(t, http.MethodPatch, server.URL+"/api/projects/"+projectB.ProjectID,
+		map[string]string{"owner_email": "Bob@Example.com"}, headersAdmin)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("assign owner status = %d, body = %s", resp.StatusCode, body)
+	}
+	var assigned struct {
+		OwnerEmail string `json:"owner_email"`
+	}
+	if err := json.Unmarshal(body, &assigned); err != nil {
+		t.Fatalf("decode assigned project: %v", err)
+	}
+	if assigned.OwnerEmail != "bob@example.com" {
+		t.Fatalf("owner = %q, want normalized bob@example.com", assigned.OwnerEmail)
+	}
+
+	// Non-admins cannot reassign ownership.
+	resp, _ = doJSON(t, http.MethodPatch, server.URL+"/api/projects/"+projectB.ProjectID,
+		map[string]string{"owner_email": "alice@example.com"}, headersUserA)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin assign owner status = %d, want 403", resp.StatusCode)
 	}
 
 	// Ingest sample records to Project B
@@ -577,6 +607,9 @@ func TestProjectOwnershipAndAuthorization(t *testing.T) {
 	}
 	// Non-admin list does not include legacy project
 	resp, body = doJSON(t, http.MethodGet, server.URL+"/api/projects", nil, headersUserA)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("User A list status = %d, body = %s", resp.StatusCode, body)
+	}
 	if strings.Contains(string(body), "legacy1") {
 		t.Fatalf("User A list should NOT contain legacy1: %s", body)
 	}
@@ -588,8 +621,30 @@ func TestProjectOwnershipAndAuthorization(t *testing.T) {
 	}
 	// Admin list includes legacy project
 	resp, body = doJSON(t, http.MethodGet, server.URL+"/api/projects", nil, headersAdmin)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Admin list status = %d, body = %s", resp.StatusCode, body)
+	}
 	if !strings.Contains(string(body), "legacy1") {
 		t.Fatalf("Admin list should contain legacy1: %s", body)
+	}
+
+	// -------------------------------------------------------------------
+	// Section 6: Every cross-tenant REST denial is audit-logged, with the same
+	// 404 the caller already saw.
+	// -------------------------------------------------------------------
+	denials := listAuditQuery(t, server, headersAdmin,
+		"action="+domain.AuditAccessDenied+"&project_id="+projectB.ProjectID)
+	if len(denials) != 5 {
+		t.Fatalf("access.denied events = %d, want 5 (project, metrics, anomalies, thresholds, websocket): %+v",
+			len(denials), denials)
+	}
+	for _, event := range denials {
+		if event.ActorEmail != "alice@example.com" {
+			t.Fatalf("denial actor = %q, want alice@example.com", event.ActorEmail)
+		}
+		if event.Outcome != domain.AuditOutcomeFailure {
+			t.Fatalf("denial outcome = %q, want failure", event.Outcome)
+		}
 	}
 }
 
@@ -768,6 +823,9 @@ func TestProjectDeletion(t *testing.T) {
 		t.Fatalf("ingest after delete status = %d, want 401", status.StatusCode)
 	}
 	resp, body = doJSON(t, http.MethodGet, server.URL+"/api/projects", nil, headersAdmin)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("list after delete status = %d, body = %s", resp.StatusCode, body)
+	}
 	if strings.Contains(string(body), project.ProjectID) {
 		t.Fatalf("deleted project still listed: %s", body)
 	}
@@ -792,8 +850,17 @@ func TestProjectDeletion(t *testing.T) {
 
 func listAudit(t *testing.T, server *httptest.Server, headers map[string]string) []domain.AuditEvent {
 	t.Helper()
+	return listAuditQuery(t, server, headers, "")
+}
 
-	response, body := doJSON(t, http.MethodGet, server.URL+"/api/audit?limit=1000", nil, headers)
+func listAuditQuery(t *testing.T, server *httptest.Server, headers map[string]string, rawQuery string) []domain.AuditEvent {
+	t.Helper()
+
+	path := server.URL + "/api/audit?limit=1000"
+	if rawQuery != "" {
+		path += "&" + rawQuery
+	}
+	response, body := doJSON(t, http.MethodGet, path, nil, headers)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("audit list status = %d, body = %s", response.StatusCode, body)
 	}
@@ -1076,5 +1143,115 @@ func TestAuditRecordsWebSocketAccessDenial(t *testing.T) {
 	}
 	if len(denials) != 1 {
 		t.Fatalf("access.denied events after owner connect = %d, want still 1: %+v", len(denials), denials)
+	}
+}
+
+func createProjectAs(t *testing.T, baseURL string, headers map[string]string, name string) createdProject {
+	t.Helper()
+
+	resp, body := doJSON(t, http.MethodPost, baseURL+"/api/projects", map[string]string{"name": name}, headers)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create project status = %d, body = %s", resp.StatusCode, body)
+	}
+	var project createdProject
+	if err := json.Unmarshal(body, &project); err != nil {
+		t.Fatalf("decode project: %v", err)
+	}
+	return project
+}
+
+func TestProjectDeletionClosesLiveStream(t *testing.T) {
+	server, _ := newProxyTestServer(t, []string{"admin@example.com"})
+	headersAdmin := map[string]string{"X-Auth-Request-Email": "admin@example.com"}
+
+	project := createProjectAs(t, server.URL, headersAdmin, "Stream Doomed")
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/" + project.ProjectID
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"X-Auth-Request-Email": []string{"admin@example.com"}})
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var envelope struct {
+		EventType string `json:"event_type"`
+	}
+	if err := conn.ReadJSON(&envelope); err != nil {
+		t.Fatalf("read initial snapshot: %v", err)
+	}
+
+	resp, body := doJSON(t, http.MethodDelete, server.URL+"/api/projects/"+project.ProjectID, nil, headersAdmin)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	// The hub drops the project's subscribers, so the open stream ends instead
+	// of staying silent forever.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, _, err := conn.ReadMessage(); err == nil {
+		t.Fatal("expected the live stream to close after project deletion")
+	}
+}
+
+func TestAuditFeedFiltersAndCursor(t *testing.T) {
+	server, _ := newProxyTestServer(t, []string{"admin@example.com"})
+	headersAdmin := map[string]string{"X-Auth-Request-Email": "admin@example.com"}
+	headersUserA := map[string]string{"X-Auth-Request-Email": "alice@example.com"}
+
+	project := createProjectAs(t, server.URL, headersAdmin, "Audit Filter")
+
+	// Distinct millisecond timestamps keep the cursor assertion deterministic:
+	// SQLite stores audit timestamps as unix milliseconds.
+	time.Sleep(3 * time.Millisecond)
+	if resp, _ := doJSON(t, http.MethodPost, server.URL+"/api/projects/"+project.ProjectID+"/api-key", nil, headersAdmin); resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate status = %d", resp.StatusCode)
+	}
+	time.Sleep(3 * time.Millisecond)
+	if resp, _ := doJSON(t, http.MethodDelete, server.URL+"/api/projects/"+project.ProjectID+"/api-key", nil, headersAdmin); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke status = %d", resp.StatusCode)
+	}
+
+	all := listAudit(t, server, headersAdmin)
+	if len(all) != 3 {
+		t.Fatalf("audit events = %d, want 3: %+v", len(all), all)
+	}
+	if all[0].Action != domain.AuditKeyRevoke || all[2].Action != domain.AuditProjectCreate {
+		t.Fatalf("unexpected order: %+v", all)
+	}
+
+	byAction := listAuditQuery(t, server, headersAdmin, "action="+domain.AuditKeyRotate)
+	if len(byAction) != 1 || byAction[0].Action != domain.AuditKeyRotate {
+		t.Fatalf("action filter = %+v, want one rotate", byAction)
+	}
+
+	unknownAction := listAuditQuery(t, server, headersAdmin, "action=does.not.exist")
+	if len(unknownAction) != 0 {
+		t.Fatalf("unknown action returned %d events, want 0", len(unknownAction))
+	}
+
+	byProject := listAuditQuery(t, server, headersAdmin, "project_id="+project.ProjectID)
+	if len(byProject) != 3 {
+		t.Fatalf("project filter = %d events, want 3", len(byProject))
+	}
+
+	cursor := url.Values{}
+	cursor.Set("before", all[1].Ts.Format(time.RFC3339Nano))
+	cursor.Set("before_id", strconv.FormatInt(all[1].ID, 10))
+	older := listAuditQuery(t, server, headersAdmin, cursor.Encode())
+	if len(older) != 1 || older[0].Action != domain.AuditProjectCreate {
+		t.Fatalf("cursor page = %+v, want only the create", older)
+	}
+
+	// A malformed cursor is a client error, not a silent full dump.
+	resp, _ := doJSON(t, http.MethodGet, server.URL+"/api/audit?before=not-a-timestamp", nil, headersAdmin)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid cursor status = %d, want 400", resp.StatusCode)
+	}
+
+	// The feed stays admin-only.
+	resp, _ = doJSON(t, http.MethodGet, server.URL+"/api/audit", nil, headersUserA)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-admin audit status = %d, want 403", resp.StatusCode)
 	}
 }

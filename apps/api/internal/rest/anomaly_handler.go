@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"traffic-center/anomaly"
+	"traffic-center/domain"
 	"traffic-center/internal/httpx"
 	"traffic-center/project"
 )
@@ -15,11 +16,12 @@ import (
 type AnomalyHandler struct {
 	projects  *project.Usecase
 	anomalies *anomaly.Usecase
+	audit     domain.AuditSink
 }
 
 // NewAnomalyHandler wires the anomaly handler.
-func NewAnomalyHandler(projects *project.Usecase, anomalies *anomaly.Usecase) *AnomalyHandler {
-	return &AnomalyHandler{projects: projects, anomalies: anomalies}
+func NewAnomalyHandler(projects *project.Usecase, anomalies *anomaly.Usecase, audit domain.AuditSink) *AnomalyHandler {
+	return &AnomalyHandler{projects: projects, anomalies: anomalies, audit: audit}
 }
 
 // List handles GET /api/projects/{projectID}/anomalies?limit=.
@@ -27,6 +29,7 @@ func (h *AnomalyHandler) List(w http.ResponseWriter, r *http.Request) {
 	projectID := chi.URLParam(r, "projectID")
 
 	if _, err := h.projects.Get(r.Context(), projectID); err != nil {
+		auditDenial(h.audit, r, err)
 		httpx.Error(w, r, err)
 		return
 	}

@@ -26,7 +26,7 @@ func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Threshold, 
 		return domain.Threshold{}, err
 	}
 	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
-		return domain.Threshold{}, domain.ErrNotFound
+		return domain.Threshold{}, domain.ErrAccessDenied
 	}
 
 	thresholds, err := u.thresholds.Get(ctx, projectID)
@@ -46,7 +46,7 @@ func (u *Usecase) Update(ctx context.Context, projectID string, thresholds domai
 		return err
 	}
 	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
-		return domain.ErrNotFound
+		return domain.ErrAccessDenied
 	}
 	if err := thresholds.Validate(); err != nil {
 		return err

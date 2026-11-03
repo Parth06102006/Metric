@@ -19,8 +19,8 @@ services:
       WORKER_INTERVAL: ${WORKER_INTERVAL:-5s}
       SNAPSHOT_RETENTION: ${SNAPSHOT_RETENTION:-168h}
       AUDIT_RETENTION: ${AUDIT_RETENTION:-2160h}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.0-flash}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      JEV_MODEL: ${JEV_MODEL:-typesafe/jev-1.14}
     volumes:
       - metric-data:/data
     healthcheck:

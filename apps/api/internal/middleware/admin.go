@@ -41,13 +41,13 @@ func recordAdminDenied(sink domain.AuditSink, r *http.Request, actorEmail, reaso
 	if sink == nil {
 		return
 	}
-	sink.Record(r.Context(), domain.AuditEvent{
-		Ts:        time.Now().UTC(),
+	_ = sink.Record(r.Context(), domain.AuditEvent{
+		Ts:         time.Now().UTC(),
 		ActorEmail: domain.SanitizeActor(actorEmail),
-		Action:    domain.AuditAdminDenied,
-		Outcome:   domain.AuditOutcomeFailure,
-		RequestID: reqid.From(r.Context()),
-		Details:   map[string]string{"reason": reason, "method": r.Method, "path": r.URL.Path},
+		Action:     domain.AuditAdminDenied,
+		Outcome:    domain.AuditOutcomeFailure,
+		RequestID:  reqid.From(r.Context()),
+		Details:    map[string]string{"reason": reason, "method": r.Method, "path": r.URL.Path},
 	})
 }
 

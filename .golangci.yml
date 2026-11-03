@@ -1,0 +1,19 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, and unused
+  default: standard
+  exclusions:
+    rules:
+      # Cleanup errors in tests do not change the outcome under test. Keep
+      # errcheck enabled for all other calls, including production cleanup.
+      - path: '_test\.go$'
+        linters: [errcheck]
+        text: 'Error return value of `.*\.Close` is not checked'
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

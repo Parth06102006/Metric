@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: Go API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+      - name: Download dependencies
+        run: go mod download
+        working-directory: apps/api
+      - name: Test and vet
+        run: make api-test api-vet
+      - name: Go lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.15.0
+          working-directory: apps/api
+          args: --config ../../.golangci.yml
+      - name: Race tests
+        run: make api-race
+      - name: Scan Go vulnerabilities
+        run: make api-vuln
+      - name: Build API
+        run: make api-build
+
+  performance-smoke:
+    name: k6 smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+      - uses: grafana/setup-k6-action@v1.2.2
+        with:
+          k6-version: '2.3.0'
+      - name: Run isolated k6 smoke profile
+        run: |
+          mkdir -p load-test-results
+          make perf-smoke
+        env:
+          METRIC_K6_SUMMARY: ${{ github.workspace }}/load-test-results/k6-smoke.json
+      - name: Upload k6 summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-smoke-results
+          path: load-test-results/k6-smoke.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: apps/web
+      - name: Audit web dependencies
+        run: make web-audit
+      - name: Validate OpenAPI and generated code
+        run: make api-contract-check
+      - name: Test
+        run: make web-test
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+        working-directory: apps/web
+      - name: Browser end-to-end tests
+        run: make web-e2e
+      - name: Upload Playwright results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
