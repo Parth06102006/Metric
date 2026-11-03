@@ -8,15 +8,15 @@ import (
 
 func TestRedactDetails(t *testing.T) {
 	redacted := domain.RedactDetails(map[string]string{
-		"api_key":       "sk-live-abc",
-		"auth_token":    "tok",
-		"password":      "hunter2",
+		"api_key":        "sk-live-abc",
+		"auth_token":     "tok",
+		"password":       "hunter2",
 		"SESSION_COOKIE": "c",
-		"Authorization": "Bearer x",
-		"proxy_secret":  "s",
-		"credentials":   "c",
-		"project_name":  "Checkout API",
-		"path":          "/api/projects/p1/api-key",
+		"Authorization":  "Bearer x",
+		"proxy_secret":   "s",
+		"credentials":    "c",
+		"project_name":   "Checkout API",
+		"path":           "/api/projects/p1/api-key",
 	})
 
 	for _, sensitive := range []string{"api_key", "auth_token", "password", "SESSION_COOKIE", "Authorization", "proxy_secret", "credentials"} {

@@ -98,7 +98,7 @@ func (h *Handler) recordAccessDenied(r *http.Request, actorEmail, projectID stri
 	if h.audit == nil {
 		return
 	}
-	h.audit.Record(r.Context(), domain.AuditEvent{
+	_ = h.audit.Record(r.Context(), domain.AuditEvent{
 		Ts:              time.Now().UTC(),
 		ActorEmail:      domain.SanitizeActor(actorEmail),
 		Action:          domain.AuditAccessDenied,
@@ -134,8 +134,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("websocket upgrade failed", "project_id", projectID, "error", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
+	// Ownership may change after the first lookup but before registration. Recheck
+	// under the same fence used by ownership changes and project deletion.
+	h.hub.accessMu.RLock()
+	current, err := h.projects.Get(r.Context(), projectID)
+	identity, hasIdentity := domain.IdentityFrom(r.Context())
+	if err != nil || (hasIdentity && !current.CanAccess(identity)) {
+		h.hub.accessMu.RUnlock()
+		if err == nil && hasIdentity {
+			h.recordAccessDenied(r, identity.Email, projectID)
+		}
+		return
+	}
 	client := h.hub.Register(projectID)
 	defer h.hub.Unregister(projectID, client)
 
@@ -156,8 +168,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	if !h.sendInitialSnapshot(conn, projectID) {
+		h.hub.accessMu.RUnlock()
 		return
 	}
+	h.hub.accessMu.RUnlock()
 
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
@@ -168,8 +182,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 
 		case message := <-client.Send():
+			h.hub.accessMu.RLock()
+			// A queued message can race a closed client; do not write it after
+			// ownership changes or deletion have returned.
+			select {
+			case <-client.Done():
+				h.hub.accessMu.RUnlock()
+				return
+			default:
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			err := conn.WriteMessage(websocket.TextMessage, message)
+			h.hub.accessMu.RUnlock()
+			if err != nil {
 				return
 			}
 

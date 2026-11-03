@@ -36,7 +36,7 @@ func Error(w http.ResponseWriter, r *http.Request, err error) {
 	message := "internal server error"
 
 	switch {
-	case errors.Is(err, domain.ErrNotFound):
+	case errors.Is(err, domain.ErrNotFound), errors.Is(err, domain.ErrAccessDenied):
 		status, message = http.StatusNotFound, "not found"
 	case errors.Is(err, domain.ErrValidation):
 		status = http.StatusBadRequest
@@ -59,7 +59,7 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBody)
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(destination); err != nil {

@@ -80,19 +80,19 @@ func (c *Client) allow(projectID string) bool {
 
 func (c *Client) fallback(anomaly domain.Anomaly, snapshot domain.Snapshot) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("[Rule-Based Analysis] %s (severity: %s). ", anomaly.Message, anomaly.Severity))
+	fmt.Fprintf(&sb, "[Rule-Based Analysis] %s (severity: %s). ", anomaly.Message, anomaly.Severity)
 
 	switch anomaly.Type {
 	case "high_traffic":
-		sb.WriteString(fmt.Sprintf("Traffic reached %.2f RPS across %d unique IPs.", snapshot.RPS, snapshot.UniqueIPs))
+		fmt.Fprintf(&sb, "Traffic reached %.2f RPS across %d unique IPs.", snapshot.RPS, snapshot.UniqueIPs)
 	case "high_error_rate":
-		sb.WriteString(fmt.Sprintf("Observed %.2f%% error rate with %.2f ms P95 latency.", snapshot.ErrorRate, snapshot.P95))
+		fmt.Fprintf(&sb, "Observed %.2f%% error rate with %.2f ms P95 latency.", snapshot.ErrorRate, snapshot.P95)
 	case "high_latency":
-		sb.WriteString(fmt.Sprintf("P95 latency spiked to %.2f ms (P50: %.2f ms, P99: %.2f ms).", snapshot.P95, snapshot.P50, snapshot.P99))
+		fmt.Fprintf(&sb, "P95 latency spiked to %.2f ms (P50: %.2f ms, P99: %.2f ms).", snapshot.P95, snapshot.P50, snapshot.P99)
 	case "possible_ip_flood":
-		sb.WriteString(fmt.Sprintf("Single client IP is generating %.2f RPS out of total %.2f RPS.", snapshot.TopIPRPS, snapshot.RPS))
+		fmt.Fprintf(&sb, "Single client IP is generating %.2f RPS out of total %.2f RPS.", snapshot.TopIPRPS, snapshot.RPS)
 	default:
-		sb.WriteString(fmt.Sprintf("Current metric value: %.2f (configured threshold: %.2f).", anomaly.Value, anomaly.Threshold))
+		fmt.Fprintf(&sb, "Current metric value: %.2f (configured threshold: %.2f).", anomaly.Value, anomaly.Threshold)
 	}
 
 	if len(snapshot.Endpoints) > 0 {
@@ -105,7 +105,7 @@ func (c *Client) fallback(anomaly domain.Anomaly, snapshot domain.Snapshot) stri
 			}
 		}
 		if topEndpoint != "" {
-			sb.WriteString(fmt.Sprintf(" Most active endpoint: %s (%d requests).", topEndpoint, topCount))
+			fmt.Fprintf(&sb, " Most active endpoint: %s (%d requests).", topEndpoint, topCount)
 		}
 	}
 
@@ -163,7 +163,7 @@ func (c *Client) callGemini(ctx context.Context, anomaly domain.Anomaly, snapsho
 	if err != nil {
 		return "", err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("gemini returned status %d", response.StatusCode)

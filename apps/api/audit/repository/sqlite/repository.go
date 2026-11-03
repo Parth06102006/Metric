@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"traffic-center/domain"
@@ -52,18 +53,44 @@ func (r *Repository) Prune(ctx context.Context, before time.Time) (int64, error)
 	return result.RowsAffected()
 }
 
-func (r *Repository) List(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
+// List returns matching audit events, newest first. An empty query returns the
+// most recent events up to the default cap; the usecase validates the limit.
+func (r *Repository) List(ctx context.Context, query domain.AuditQuery) ([]domain.AuditEvent, error) {
+	limit := query.Limit
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, ts, actor_email, action, target_project_id, outcome, request_id, details_json
-		 FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?`, limit,
-	)
+
+	conditions := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+
+	if action := strings.TrimSpace(query.Action); action != "" {
+		conditions = append(conditions, "action = ?")
+		args = append(args, action)
+	}
+	if projectID := strings.TrimSpace(query.ProjectID); projectID != "" {
+		conditions = append(conditions, "target_project_id = ?")
+		args = append(args, projectID)
+	}
+	if !query.Before.IsZero() {
+		ts := query.Before.UTC().UnixMilli()
+		conditions = append(conditions, "(ts < ? OR (ts = ? AND id < ?))")
+		args = append(args, ts, ts, query.BeforeID)
+	}
+
+	statement := `SELECT id, ts, actor_email, action, target_project_id, outcome, request_id, details_json
+		 FROM audit_events`
+	if len(conditions) > 0 {
+		statement += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	statement += " ORDER BY ts DESC, id DESC LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := r.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	events := make([]domain.AuditEvent, 0)
 	for rows.Next() {

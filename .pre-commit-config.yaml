@@ -1,0 +1,56 @@
+# Keep quick, local checks here; CI runs the full test, browser and security suites.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: detect-private-key
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+
+  - repo: https://github.com/golangci/golangci-lint
+    rev: 49ff9b7f5e2eca29d113af14fbf722b87b22b50a # v2.15.0
+    hooks:
+      - id: golangci-lint-full
+        name: Go lint
+        # Run the whole module without --fix, including for config changes.
+        entry: bash -c 'cd apps/api && golangci-lint run --config ../../.golangci.yml ./...'
+        language_version: 1.27.3
+        types: [file]
+        files: ^(apps/api/(.*\.go|go\.(mod|sum))|\.golangci\.yml)$
+
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -w
+        language: system
+        types: [go]
+
+      - id: go-vet
+        name: Go vet
+        entry: make api-vet
+        language: system
+        files: ^apps/api/(.*\.go|go\.(mod|sum))$
+        pass_filenames: false
+
+      - id: web-typecheck
+        name: Frontend typecheck
+        entry: make web-typecheck
+        language: system
+        files: ^apps/web/(src/|e2e/|.*\.(ts|tsx|json)$|bun\.lock$)
+        pass_filenames: false
+
+      - id: openapi-generated
+        name: OpenAPI validation and generated-code check
+        entry: make api-contract-check
+        language: system
+        files: ^(apps/api/openapi\.yaml|apps/web/(openapi-ts\.config\.ts|scripts/(validate-openapi\.mjs|check-generated-api\.sh)|src/generated/api/.*|package\.json|bun\.lock))$
+        pass_filenames: false

@@ -30,6 +30,9 @@ node_modules/
 dist/
 apps/web/dist/
 apps/web/.vite/
+apps/web/playwright-report/
+apps/web/test-results/
+load-test-results/
 coverage/
 
 # Build output

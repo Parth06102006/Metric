@@ -4,9 +4,10 @@ import "strings"
 
 // Project is an ingest target owned by one tenant.
 type Project struct {
-	ID         string `json:"project_id"`
-	Name       string `json:"name"`
-	OwnerEmail string `json:"owner_email,omitempty"`
+	ID         string   `json:"project_id"`
+	Name       string   `json:"name"`
+	OwnerEmail string   `json:"owner_email,omitempty"`
+	Viewers    []string `json:"-"`
 }
 
 // CanAccess reports whether the caller identity may access this project.
@@ -16,7 +17,15 @@ func (p Project) CanAccess(identity Identity) bool {
 	if identity.Admin {
 		return true
 	}
-	return p.OwnerEmail != "" && strings.EqualFold(p.OwnerEmail, identity.Email)
+	if p.OwnerEmail != "" && strings.EqualFold(p.OwnerEmail, identity.Email) {
+		return true
+	}
+	for _, email := range p.Viewers {
+		if strings.EqualFold(email, identity.Email) {
+			return true
+		}
+	}
+	return false
 }
 
 // ProjectWithKey is returned exactly once, when the project is created.

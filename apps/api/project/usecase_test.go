@@ -94,10 +94,10 @@ func TestProjectOwnershipAndAccessControl(t *testing.T) {
 		t.Fatalf("User A get Project A error = %v", err)
 	}
 
-	// User B CANNOT get Project A (must return ErrNotFound to avoid leaking existence)
+	// User B CANNOT get Project A (ErrAccessDenied maps to 404, so existence is not leaked)
 	_, err = usecase.Get(ctxUserB, createdA.ID)
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("User B get Project A error = %v, want ErrNotFound", err)
+	if !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("User B get Project A error = %v, want ErrAccessDenied", err)
 	}
 
 	// Admin CAN get Project A
@@ -150,10 +150,10 @@ func TestLegacyProjectAccess(t *testing.T) {
 	ctxUser := domain.WithIdentity(context.Background(), user)
 	ctxAdmin := domain.WithIdentity(context.Background(), admin)
 
-	// Regular user cannot get legacy project (returns ErrNotFound)
+	// Regular user cannot get legacy project (ErrAccessDenied maps to 404)
 	_, err := usecase.Get(ctxUser, "legacy1")
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("regular user get legacy error = %v, want ErrNotFound", err)
+	if !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("regular user get legacy error = %v, want ErrAccessDenied", err)
 	}
 
 	// Regular user does not see legacy project in list

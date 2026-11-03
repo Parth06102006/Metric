@@ -13,6 +13,11 @@ var (
 	ErrUnauthorized = errors.New("unauthorized")
 	ErrForbidden    = errors.New("forbidden")
 	ErrConflict     = errors.New("conflict")
+	// ErrAccessDenied means the caller is authenticated but not allowed to
+	// reach this resource. Delivery maps it to the same 404 as ErrNotFound so
+	// the API never reveals whether the resource exists, while handlers can
+	// still audit the denial.
+	ErrAccessDenied = errors.New("access denied")
 )
 
 // Validationf builds a validation error with a human-readable detail.

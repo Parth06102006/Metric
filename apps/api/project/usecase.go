@@ -64,9 +64,22 @@ func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Project, er
 		return domain.Project{}, err
 	}
 	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
-		return domain.Project{}, domain.ErrNotFound
+		return domain.Project{}, domain.ErrAccessDenied
 	}
 	return p, nil
+}
+
+// KnownUsers lists identities observed at a trusted sign-in; delivery is admin-only.
+func (u *Usecase) KnownUsers(ctx context.Context) ([]string, error) {
+	return u.repo.ListUsers(ctx)
+}
+
+// Viewers returns project members; delivery is admin-only.
+func (u *Usecase) Viewers(ctx context.Context, projectID string) ([]string, error) {
+	if _, err := u.repo.Get(ctx, projectID); err != nil {
+		return nil, err
+	}
+	return u.repo.ListMembers(ctx, projectID)
 }
 
 // List returns projects accessible to the caller. Admins see all projects

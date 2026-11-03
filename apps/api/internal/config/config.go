@@ -36,6 +36,8 @@ type Config struct {
 
 	GeminiAPIKey string
 	GeminiModel  string
+	JevAPIKey    string
+	JevModel     string
 }
 
 // Load reads configuration from the environment and applies safe defaults.
@@ -63,6 +65,8 @@ func Load() (Config, error) {
 		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 		GeminiAPIKey:      os.Getenv("GEMINI_API_KEY"),
 		GeminiModel:       env("GEMINI_MODEL", "gemini-2.0-flash"),
+		JevAPIKey:         os.Getenv("OPENROUTER_API_KEY"),
+		JevModel:          env("JEV_MODEL", "typesafe/jev-1.14"),
 	}
 
 	if port := os.Getenv("PORT"); port != "" {

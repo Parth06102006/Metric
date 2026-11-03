@@ -36,6 +36,12 @@ func (u *Usecase) Current(ctx context.Context, projectID string) (domain.Snapsho
 	return domain.Compute(records, int(u.window.Seconds())), nil
 }
 
+// RecentHistory returns a bounded recent series for the live graph.
+func (u *Usecase) RecentHistory(ctx context.Context, projectID string) ([]domain.Snapshot, error) {
+	const capacity = 900
+	return u.snapshots.Recent(ctx, projectID, capacity)
+}
+
 // History returns persisted snapshots in a time range.
 func (u *Usecase) History(ctx context.Context, projectID string, from, to time.Time, limit int) ([]domain.Snapshot, error) {
 	if limit <= 0 || limit > 5000 {

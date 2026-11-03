@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"traffic-center/domain"
@@ -74,10 +75,13 @@ func (u *Usecase) Log(ctx context.Context, actorEmail, action, targetProjectID, 
 	_ = u.Record(ctx, event)
 }
 
-// List returns recent audit events, oldest-capped, newest first.
-func (u *Usecase) List(ctx context.Context, limit int) ([]domain.AuditEvent, error) {
-	if limit <= 0 || limit > MaxListSize {
-		limit = 100
+// List returns matching audit events, newest first. An out-of-range limit falls
+// back to the default page size so a bad query string cannot drain the table.
+func (u *Usecase) List(ctx context.Context, query domain.AuditQuery) ([]domain.AuditEvent, error) {
+	if query.Limit <= 0 || query.Limit > MaxListSize {
+		query.Limit = 100
 	}
-	return u.repo.List(ctx, limit)
+	query.Action = strings.TrimSpace(query.Action)
+	query.ProjectID = strings.TrimSpace(query.ProjectID)
+	return u.repo.List(ctx, query)
 }

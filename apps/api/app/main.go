@@ -18,8 +18,9 @@ import (
 	"traffic-center/audit"
 	auditsqlite "traffic-center/audit/repository/sqlite"
 	"traffic-center/ingest"
+	"traffic-center/internal/analysis"
 	"traffic-center/internal/config"
-	"traffic-center/internal/llm"
+	"traffic-center/internal/jev"
 	"traffic-center/internal/server"
 	"traffic-center/internal/sqlite"
 	"traffic-center/internal/ws"
@@ -63,7 +64,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			logger.Error("closing database", "error", err)
+		}
+	}()
 
 	// Repositories (adapters).
 	projectRepo := projectsqlite.New(db)
@@ -81,8 +86,14 @@ func run() error {
 	metricsUsecase := metrics.NewUsecase(recordRepo, snapshotRepo, cfg.MetricsWindow)
 	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo)
 
-	explainer := llm.New(cfg.GeminiAPIKey, cfg.GeminiModel)
-	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, explainer, hub, cfg.DedupeWindow)
+	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, nil, hub, cfg.DedupeWindow)
+	if cfg.JevAPIKey != "" {
+		analyst := analysis.NewWorker(anomalyRepo, jev.New(cfg.JevAPIKey, cfg.JevModel), snapshotRepo)
+		analyst.SetBroadcaster(hub)
+		analyst.Start()
+		defer analyst.Stop()
+		anomalyUsecase.EnableAsyncAnalysis(1000, analyst.Notify)
+	}
 	auditUsecase := audit.NewUsecase(auditRepo, logger)
 
 	worker := anomaly.NewWorker(
@@ -191,7 +202,7 @@ func healthcheck() int {
 	if err != nil {
 		return 1
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	if response.StatusCode != http.StatusOK {
 		return 1

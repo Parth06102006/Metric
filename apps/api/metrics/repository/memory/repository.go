@@ -66,6 +66,7 @@ func (r *Repository) ActiveProjects(_ context.Context) []string {
 			delete(r.projects, projectID)
 			continue
 		}
+		r.projects[projectID] = active
 		ids = append(ids, projectID)
 	}
 	sort.Strings(ids)
