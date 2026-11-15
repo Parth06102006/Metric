@@ -1,0 +1,109 @@
+rule_files:
+  - ../../deploy/monitoring/alerts.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'metric_disk_available_bytes{metric_deployment="metric"}'
+        values: '15+0x30'
+      - series: 'metric_disk_total_bytes{metric_deployment="metric"}'
+        values: '100+0x30'
+      - series: 'metric_disk_stat_success{metric_deployment="metric"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: MetricDiskLow
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: warning}
+            exp_annotations: {summary: 'Metric database filesystem has less than 20% available'}
+      - eval_time: 15m
+        alertname: MetricDiskCritical
+  - interval: 1m
+    input_series:
+      - series: 'metric_disk_available_bytes{metric_deployment="metric"}'
+        values: '8+0x30'
+      - series: 'metric_disk_total_bytes{metric_deployment="metric"}'
+        values: '100+0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MetricDiskCritical
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: critical}
+            exp_annotations: {summary: 'Metric database filesystem has less than 10% available'}
+      - eval_time: 10m
+        alertname: MetricDiskLow
+  - interval: 1m
+    input_series:
+      - series: 'metric_backup_last_success_timestamp_seconds{metric_deployment="metric"}'
+        values: '0+0x150'
+      - series: 'metric_backup_last_attempt_success{metric_deployment="metric"}'
+        values: '0+0x20'
+      - series: 'metric_backup_last_attempt_timestamp_seconds{metric_deployment="metric"}'
+        values: '1+0x20'
+      - series: 'metric_backup_in_progress{metric_deployment="metric"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 130m
+        alertname: MetricBackupTooOld
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: critical}
+            exp_annotations: {summary: 'No verified R2 upload for over two hours'}
+      - eval_time: 10m
+        alertname: MetricBackupFailed
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: warning}
+            exp_annotations: {summary: 'Latest Metric backup attempt failed'}
+      - eval_time: 15m
+        alertname: MetricMetricsMissing
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: critical}
+            exp_annotations: {summary: 'Metric monitoring data stopped arriving'}
+  - interval: 1m
+    input_series:
+      - series: 'metric_backup_last_attempt_success{metric_deployment="metric"}'
+        values: '0+0x20'
+      - series: 'metric_backup_last_attempt_timestamp_seconds{metric_deployment="metric"}'
+        values: '1+0x20'
+      - series: 'metric_backup_in_progress{metric_deployment="metric"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MetricBackupFailed
+  - interval: 1m
+    input_series:
+      - series: 'metric_api_ready{metric_deployment="metric"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MetricAPINotReady
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: critical}
+            exp_annotations: {summary: 'Metric API is unreachable or durable storage is not ready'}
+  - interval: 1m
+    input_series:
+      - series: 'metric_analysis_pending_jobs{metric_deployment="metric"}'
+        values: '1+0x25'
+      - series: 'metric_analysis_oldest_job_timestamp_seconds{metric_deployment="metric"}'
+        values: '1+0x25'
+      - series: 'metric_analysis_queue_stat_success{metric_deployment="metric"}'
+        values: '1+0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: MetricAnalysisQueueStalled
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: warning}
+            exp_annotations: {summary: 'Metric advisory analysis queue is over ten minutes old'}
+  - interval: 1m
+    input_series:
+      - series: 'metric_backup_last_restore_attempt_success{metric_deployment="metric"}'
+        values: '0+0x20'
+      - series: 'metric_backup_last_restore_attempt_timestamp_seconds{metric_deployment="metric"}'
+        values: '1+0x20'
+      - series: 'metric_backup_restore_in_progress{metric_deployment="metric"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MetricRestoreCheckFailed
+        exp_alerts:
+          - exp_labels: {metric_deployment: metric, severity: warning}
+            exp_annotations: {summary: 'Latest remote restore check failed'}

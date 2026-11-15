@@ -1,0 +1,79 @@
+# Example Grafana Cloud Metrics/Prometheus alert rules.
+# Replace metric_deployment="metric" with your METRIC_DEPLOYMENT value and
+# connect alert routing to a tested contact point. See docs/operations.md.
+groups:
+  - name: metric-operations
+    interval: 1m
+    rules:
+      - alert: MetricDiskLow
+        expr: (metric_disk_available_bytes{metric_deployment="metric"} / metric_disk_total_bytes{metric_deployment="metric"} < 0.20) and (metric_disk_available_bytes{metric_deployment="metric"} / metric_disk_total_bytes{metric_deployment="metric"} >= 0.10)
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Metric database filesystem has less than 20% available"
+      - alert: MetricDiskCritical
+        expr: metric_disk_available_bytes{metric_deployment="metric"} / metric_disk_total_bytes{metric_deployment="metric"} < 0.10
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Metric database filesystem has less than 10% available"
+      - alert: MetricBackupTooOld
+        expr: time() - metric_backup_last_success_timestamp_seconds{metric_deployment="metric"} > 7200
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "No verified R2 upload for over two hours"
+      - alert: MetricBackupFailed
+        expr: (metric_backup_last_attempt_success{metric_deployment="metric"} == 0) and (metric_backup_last_attempt_timestamp_seconds{metric_deployment="metric"} > 0) and (metric_backup_in_progress{metric_deployment="metric"} == 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Latest Metric backup attempt failed"
+      - alert: MetricRestoreCheckTooOld
+        expr: time() - metric_backup_last_restore_success_timestamp_seconds{metric_deployment="metric"} > 3024000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful remote restore check for over 35 days"
+      - alert: MetricRestoreCheckFailed
+        expr: (metric_backup_last_restore_attempt_success{metric_deployment="metric"} == 0) and (metric_backup_last_restore_attempt_timestamp_seconds{metric_deployment="metric"} > 0) and (metric_backup_restore_in_progress{metric_deployment="metric"} == 0)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Latest remote restore check failed"
+      - alert: MetricMetricsMissing
+        expr: absent_over_time(metric_disk_stat_success{metric_deployment="metric"}[10m])
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Metric monitoring data stopped arriving"
+      - alert: MetricExporterUnavailable
+        expr: up{job="metric-ops",metric_deployment="metric"} == 0 or up{job="metric-node",metric_deployment="metric"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "A Metric monitoring exporter is unavailable"
+      - alert: MetricAPINotReady
+        expr: metric_api_ready{metric_deployment="metric"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Metric API is unreachable or durable storage is not ready"
+      - alert: MetricAnalysisQueueStalled
+        expr: (time() - metric_analysis_oldest_job_timestamp_seconds{metric_deployment="metric"} > 600) and (metric_analysis_pending_jobs{metric_deployment="metric"} > 0) and (metric_analysis_queue_stat_success{metric_deployment="metric"} == 1)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Metric advisory analysis queue is over ten minutes old"
+      - alert: MetricAnalysisQueueCheckFailed
+        expr: metric_analysis_queue_stat_success{metric_deployment="metric"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Metric analysis queue metrics cannot be read"
+      - alert: MetricFilesystemChecksFailed
+        expr: metric_disk_stat_success{metric_deployment="metric"} == 0 or metric_database_stat_success{metric_deployment="metric"} == 0 or metric_wal_stat_success{metric_deployment="metric"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Metric disk or database size measurements are failing"
