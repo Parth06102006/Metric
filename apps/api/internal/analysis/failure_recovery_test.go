@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync/atomic"
@@ -10,7 +11,6 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
 	storesqlite "traffic-center/internal/sqlite"
 )
 
@@ -19,12 +19,12 @@ type transientAnalyst struct {
 	failed chan time.Time
 }
 
-func (a *transientAnalyst) Diagnose(context.Context, jev.State) (jev.Result, error) {
+func (a *transientAnalyst) Diagnose(context.Context, domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	if a.calls.Add(1) == 1 {
 		a.failed <- time.Now()
-		return jev.Result{}, errors.New("simulated transient provider outage")
+		return domain.AnalysisResult{}, errors.New("simulated transient provider outage")
 	}
-	return jev.Result{Pattern: "unclear", Direction: "more_evidence", Model: "recovery-fake"}, nil
+	return domain.AnalysisResult{Pattern: "unclear", Direction: "more_evidence", Model: "recovery-fake"}, nil
 }
 
 type recoveryUpdates struct{ events chan domain.Anomaly }
@@ -33,15 +33,17 @@ func (u *recoveryUpdates) BroadcastSnapshot(string, domain.Snapshot)   {}
 func (u *recoveryUpdates) BroadcastAnomaly(_ string, a domain.Anomaly) { u.events <- a }
 func (u *recoveryUpdates) Drop(string)                                 {}
 
-// This intentionally exercises the real worker's 30-second provider rate
-// limit rather than fast-forwarding its clock or shortening production delays.
-func TestProviderFailureRecoveryWithRealRetry(t *testing.T) {
+// Provider errors leave the rule alert intact without a potentially billed retry.
+func TestProviderFailureDoesNotRetry(t *testing.T) {
 	ctx := context.Background()
 	db, err := storesqlite.Open(filepath.Join(t.TempDir(), "retry.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	a := domain.Anomaly{Type: "high_error_rate", Severity: "critical", Message: "rule alert", Analysis: "Rule-based alert: rule alert", DetectedAt: time.Now()}
 	if err := repo.SaveWithAnalysis(ctx, "p", &a, domain.Snapshot{}, 10); err != nil {
@@ -53,47 +55,56 @@ func TestProviderFailureRecoveryWithRealRetry(t *testing.T) {
 	worker.SetBroadcaster(updates)
 	worker.Start()
 	defer worker.Stop()
-	var failedAt time.Time
 	select {
-	case failedAt = <-provider.failed:
+	case <-provider.failed:
 	case <-time.After(10 * time.Second):
 		t.Fatal("first provider call did not happen")
 	}
-	// The incident must remain available while the provider is unavailable.
-	rows, err := repo.List(ctx, "p", 10)
-	if err != nil || len(rows) != 1 || rows[0].ID != a.ID || rows[0].AnalysisStatus != "pending" || rows[0].Analysis == "" {
-		t.Fatalf("pending alert lost: %+v, %v", rows, err)
-	}
 	select {
 	case updated := <-updates.events:
-		if updated.ID != a.ID || updated.AnalysisStatus != "completed" {
-			t.Fatalf("bad recovery update: %+v", updated)
+		if updated.ID != a.ID || updated.AnalysisStatus != "failed" {
+			t.Fatalf("bad failure update: %+v", updated)
 		}
-	case <-time.After(45 * time.Second):
-		t.Fatal("worker did not recover after transient failure")
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker did not report failure")
 	}
-	recovery := time.Since(failedAt)
-	rows, err = repo.List(ctx, "p", 10)
-	if err != nil || len(rows) != 1 || rows[0].ID != a.ID || rows[0].AnalysisStatus != "completed" || rows[0].Diagnosis == nil {
-		t.Fatalf("recovered incident: %+v, %v", rows, err)
+	rows, err := repo.List(ctx, "p", 10)
+	if err != nil || len(rows) != 1 || rows[0].ID != a.ID || rows[0].AnalysisStatus != "failed" || rows[0].Analysis == "" {
+		t.Fatalf("rule alert lost: %+v %v", rows, err)
 	}
-	if provider.calls.Load() != 2 {
-		t.Fatalf("provider calls = %d, want 2", provider.calls.Load())
+	if provider.calls.Load() != 1 {
+		t.Fatalf("provider calls=%d", provider.calls.Load())
 	}
 	var jobs int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM analysis_jobs WHERE anomaly_id = ?`, a.ID).Scan(&jobs); err != nil || jobs != 0 {
 		t.Fatalf("remaining jobs: %d, %v", jobs, err)
 	}
-	t.Logf("provider recovery: %s; calls: %d; retries: %d; duplicate incidents: %d", recovery.Round(time.Millisecond), provider.calls.Load(), provider.calls.Load()-1, len(rows)-1)
+	t.Logf("provider failure: calls=%d; duplicate incidents=%d", provider.calls.Load(), len(rows)-1)
 }
 
-// When the result cannot be committed, the incident survives and the expired
-// lease can be retried. The second provider call illustrates the billing risk.
+type closingAnalyst struct {
+	db    *sql.DB
+	calls int
+}
+
+func (a *closingAnalyst) Diagnose(context.Context, domain.IncidentEvidence) (domain.AnalysisResult, error) {
+	a.calls++
+	if err := a.db.Close(); err != nil {
+		return domain.AnalysisResult{}, err
+	}
+	return domain.AnalysisResult{Pattern: "unclear", Direction: "more_evidence"}, nil
+}
+
+// A crash or database failure after dispatch has an unknown provider outcome;
+// recovering the lease must not send a potentially billed second request.
 func TestRecoveryAfterDatabaseFailureDuringCommit(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "commit-failure.db")
 	db, err := storesqlite.Open(path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
 		t.Fatal(err)
 	}
 	repo := anomalysqlite.New(db)
@@ -107,12 +118,9 @@ func TestRecoveryAfterDatabaseFailureDuringCommit(t *testing.T) {
 		db.Close()
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	provider := &countingAnalyst{}
+	provider := &closingAnalyst{db: db}
 	NewWorker(repo, provider, nil).process(ctx, job)
-	if provider.calls.Load() != 1 {
+	if provider.calls != 1 {
 		t.Fatal("expected provider call before failed commit")
 	}
 	db, err = storesqlite.Open(path)
@@ -125,17 +133,15 @@ func TestRecoveryAfterDatabaseFailureDuringCommit(t *testing.T) {
 	if err != nil || len(rows) != 1 || rows[0].AnalysisStatus != "pending" {
 		t.Fatalf("alert missing after failure: %+v, %v", rows, err)
 	}
-	// Simulate passage of the one-minute lease; this is not a wall-clock recovery measurement.
-	recovered, err := repo.ClaimAnalysis(ctx, time.Now().Add(2*time.Minute), time.Minute)
-	if err != nil || recovered.Attempts != 2 {
-		t.Fatalf("lease not retryable: %+v, %v", recovered, err)
+	// Simulate passage of the lease without waiting.
+	_, err = repo.ClaimAnalysis(ctx, time.Now().Add(2*time.Minute), time.Minute)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("dispatched job was retried: %v", err)
 	}
-	NewWorker(repo, provider, nil).process(ctx, recovered)
 	rows, err = repo.List(ctx, "p", 10)
-	if err != nil || len(rows) != 1 || rows[0].ID != a.ID || rows[0].AnalysisStatus != "completed" || provider.calls.Load() != 2 {
-		t.Fatalf("failed commit recovery: %+v, calls=%d, %v", rows, provider.calls.Load(), err)
+	if err != nil || len(rows) != 1 || rows[0].ID != a.ID || rows[0].AnalysisStatus != "failed" || provider.calls != 1 {
+		t.Fatalf("uncertain result recovery: %+v calls=%d %v", rows, provider.calls, err)
 	}
-	t.Logf("failed commit recovery (lease time simulated): calls=%d; retries=%d; duplicate incidents=%d", provider.calls.Load(), provider.calls.Load()-1, len(rows)-1)
 }
 
 // Close and reopen the actual SQLite database, then recover an expired lease.
@@ -144,6 +150,9 @@ func TestRecoveryAfterDatabaseReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "restart.db")
 	db, err := storesqlite.Open(path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
 		t.Fatal(err)
 	}
 	repo := anomalysqlite.New(db)

@@ -13,6 +13,9 @@ func TestAnalysisJobsSchemaSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.Exec(`INSERT INTO anomalies (project_id,type,severity,message,value,threshold,analysis,detected_at) VALUES ('p','x','high','x',1,1,'',1)`); err != nil {
 		t.Fatal(err)
 	}

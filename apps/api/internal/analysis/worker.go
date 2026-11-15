@@ -14,25 +14,26 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
 )
 
-type analyst interface {
-	Diagnose(context.Context, jev.State) (jev.Result, error)
-}
 type Worker struct {
-	repo      *anomalysqlite.Repository
-	analyst   analyst
-	snapshots domain.SnapshotRepository
-	wake      chan struct{}
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	logger    *slog.Logger
-	updates   domain.Broadcaster
+	repo       *anomalysqlite.Repository
+	analyst    domain.Analyst
+	snapshots  domain.SnapshotRepository
+	wake       chan struct{}
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	logger     *slog.Logger
+	updates    domain.Broadcaster
+	dailyLimit int
 }
 
-func NewWorker(repo *anomalysqlite.Repository, analyst analyst, snapshots domain.SnapshotRepository) *Worker {
-	return &Worker{repo: repo, analyst: analyst, snapshots: snapshots, wake: make(chan struct{}, 1), logger: slog.Default()}
+func NewWorker(repo *anomalysqlite.Repository, analyst domain.Analyst, snapshots domain.SnapshotRepository, maxDaily ...int) *Worker {
+	limit := 100
+	if len(maxDaily) > 0 && maxDaily[0] > 0 {
+		limit = maxDaily[0]
+	}
+	return &Worker{repo: repo, analyst: analyst, snapshots: snapshots, wake: make(chan struct{}, 1), logger: slog.Default(), dailyLimit: limit}
 }
 func (w *Worker) SetBroadcaster(b domain.Broadcaster) { w.updates = b }
 func (w *Worker) Start() {
@@ -103,7 +104,7 @@ func (w *Worker) process(ctx context.Context, job anomalysqlite.AnalysisJob) {
 		w.release(job, false)
 		return
 	}
-	var state jev.State
+	var state domain.IncidentEvidence
 	if err := json.Unmarshal([]byte(job.StateJSON), &state); err != nil {
 		w.fail(ctx, job, true)
 		return
@@ -119,6 +120,18 @@ func (w *Worker) process(ctx context.Context, job anomalysqlite.AnalysisJob) {
 		w.release(job, false)
 		return
 	}
+	reserved, err := w.repo.BeginAnalysisCall(ctx, job, time.Now(), w.dailyLimit)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.logger.Error("reserve incident analysis call", "error", err)
+		}
+		w.release(job, false)
+		return
+	}
+	if !reserved {
+		w.broadcast(ctx, job)
+		return
+	}
 	result, err := w.analyst.Diagnose(ctx, state)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -127,14 +140,14 @@ func (w *Worker) process(ctx context.Context, job anomalysqlite.AnalysisJob) {
 			return
 		}
 		w.logger.Warn("incident analysis failed", "project_id", job.ProjectID, "anomaly_id", job.AnomalyID, "attempt", job.Attempts, "error", err)
-		w.fail(ctx, job, job.Attempts >= 3)
+		// We cannot establish whether a failed request was billed. Never retry it.
+		w.fail(ctx, job, true)
 		return
 	}
 
 	d := domain.Diagnosis{Pattern: result.Pattern, Direction: result.Direction, Urgency: result.Urgency, PatternConfidence: result.PatternConfidence, DirectionConfidence: result.DirectionConfidence, UrgencyConfidence: result.UrgencyConfidence, EvidenceProbability: result.EvidenceProbability, Model: result.Model, InputTokens: result.InputTokens, Evidence: &state}
 	narrative := "Advisory analysis: insufficient evidence; inspect the observed metrics."
-	endpointSupported := result.Direction != "failing_endpoints" || (state.Endpoints != nil && state.Endpoints.MostErrors > 0)
-	if state.Baseline != nil && state.RequestCount != nil && *state.RequestCount >= 20 && result.EvidenceProbability >= 0.7 && result.Pattern != "unclear" && result.Direction != "more_evidence" && endpointSupported {
+	if domain.EvidenceSufficient(state, result) {
 		d.EvidenceSufficient = true
 		narrative = fmt.Sprintf("Advisory pattern: %s. Suggested investigation: %s. Review before acting.", result.Pattern, result.Direction)
 	}
@@ -151,7 +164,7 @@ func (w *Worker) release(job anomalysqlite.AnalysisJob, attempted bool) {
 	defer cancel()
 	var err error
 	if attempted {
-		err = w.repo.FailAnalysis(ctx, job, time.Now(), false)
+		err = w.repo.FailAnalysis(ctx, job, time.Now(), true)
 	} else {
 		err = w.repo.ReleaseAnalysis(ctx, job)
 	}
@@ -180,7 +193,7 @@ func (w *Worker) broadcast(ctx context.Context, job anomalysqlite.AnalysisJob) {
 		w.updates.BroadcastAnomaly(job.ProjectID, a)
 	}
 }
-func (w *Worker) baseline(ctx context.Context, projectID string, observedAt time.Time, windowSeconds int) *jev.Baseline {
+func (w *Worker) baseline(ctx context.Context, projectID string, observedAt time.Time, windowSeconds int) *domain.BaselineEvidence {
 	// Do not include snapshots overlapping the incident window. A one-minute
 	// minimum also keeps the immediate lead-up out of the comparison.
 	gap := max(time.Minute, time.Duration(windowSeconds)*time.Second)
@@ -201,5 +214,5 @@ func (w *Worker) baseline(ctx context.Context, projectID string, observedAt time
 	sort.Float64s(r)
 	sort.Float64s(p)
 	sort.Float64s(e)
-	return &jev.Baseline{Samples: len(rows), Start: rows[0].Ts, End: rows[len(rows)-1].Ts, RPS: r[len(r)/2], P95: p[len(p)/2], ErrorRate: e[len(e)/2]}
+	return &domain.BaselineEvidence{Samples: len(rows), Start: rows[0].Ts, End: rows[len(rows)-1].Ts, RPS: r[len(r)/2], P95: p[len(p)/2], ErrorRate: e[len(e)/2]}
 }

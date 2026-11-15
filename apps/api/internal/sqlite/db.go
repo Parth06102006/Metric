@@ -18,13 +18,24 @@ type RepositoryProxyHelper struct {
 	DB *sql.DB
 }
 
-const schemaVersion = 7
+const schemaVersion = 9
 const maxOpenConnections = 10
 
 var memoryDatabaseID atomic.Uint64
 
 // Open opens the SQLite database, applies pragmas, and runs migrations.
-func Open(path string) (*sql.DB, error) {
+func Open(path string) (*sql.DB, error) { return open(path, 0) }
+
+// OpenWithLimit caps the main SQLite file on every pooled connection. WAL,
+// temporary files, backups and other disk users are not covered by this cap.
+func OpenWithLimit(path string, maxBytes int64) (*sql.DB, error) {
+	if maxBytes < 1<<20 {
+		return nil, fmt.Errorf("SQLite limit must be at least 1 MiB")
+	}
+	return open(path, maxBytes)
+}
+
+func open(path string, maxBytes int64) (*sql.DB, error) {
 	base, query, customDSN := strings.Cut(path, "?")
 	params, err := url.ParseQuery(query)
 	if err != nil {
@@ -51,12 +62,36 @@ func Open(path string) (*sql.DB, error) {
 	}
 	if !customDSN && path != ":memory:" {
 		params.Add("_pragma", "journal_mode(WAL)")
-		params.Add("_pragma", "synchronous(NORMAL)")
+		// A successful ingest is acknowledged only after a durable journal commit.
+		params.Add("_pragma", "synchronous(FULL)")
 	}
 	// All current explicit transactions write. Reserve SQLite's single writer
 	// before reading so concurrent read-then-write transactions do not fail
 	// on lock upgrades or race queue capacity/lease claims.
 	params.Set("_txlock", "immediate")
+	if maxBytes > 0 {
+		if customDSN {
+			params.Add("_pragma", "synchronous(FULL)")
+		}
+		// Page size is stored in existing databases and is not necessarily 4096.
+		probe, err := sql.Open("sqlite", base+"?"+params.Encode())
+		if err != nil {
+			return nil, err
+		}
+		var pageSize int64
+		err = probe.QueryRow(`PRAGMA page_size`).Scan(&pageSize)
+		closeErr := probe.Close()
+		if err != nil {
+			return nil, err
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		if pageSize <= 0 || maxBytes/pageSize < 1 {
+			return nil, fmt.Errorf("invalid SQLite page limit")
+		}
+		params.Add("_pragma", fmt.Sprintf("max_page_count(%d)", maxBytes/pageSize))
+	}
 	dsn := base + "?" + params.Encode()
 
 	db, err := sql.Open("sqlite", dsn)
@@ -69,6 +104,35 @@ func Open(path string) (*sql.DB, error) {
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if maxBytes > 0 {
+		var mode string
+		var syncMode int
+		if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := db.QueryRow(`PRAGMA synchronous`).Scan(&syncMode); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if mode != "wal" || syncMode != 2 {
+			_ = db.Close()
+			return nil, fmt.Errorf("durable ingest requires SQLite WAL and synchronous FULL")
+		}
+		var pages, pageSize int64
+		if err := db.QueryRow(`PRAGMA page_count`).Scan(&pages); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if pages > maxBytes/pageSize {
+			_ = db.Close()
+			return nil, fmt.Errorf("existing SQLite database exceeds configured limit")
+		}
 	}
 	if err := Migrate(db); err != nil {
 		_ = db.Close()
@@ -111,6 +175,8 @@ CREATE TABLE IF NOT EXISTS project_viewers (
 CREATE INDEX IF NOT EXISTS idx_project_viewers_email ON project_viewers(email);
 `
 
+// These layouts are also used by the v1 conversion. The transactional v8
+// rebuild adds project foreign keys after legacy rows have been converted.
 const snapshotTable = `
 CREATE TABLE IF NOT EXISTS metric_snapshots (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +259,10 @@ CREATE INDEX IF NOT EXISTS idx_audit_action_ts
 // Migrate creates the schema and upgrades the v1 layout (JSON snapshot blobs,
 // text timestamps, dead alerts table) in place.
 func Migrate(db *sql.DB) error {
+	var oldVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&oldVersion); err != nil {
+		return err
+	}
 	if _, err := db.Exec(baseSchema); err != nil {
 		return fmt.Errorf("base schema: %w", err)
 	}
@@ -234,17 +304,56 @@ func Migrate(db *sql.DB) error {
 			return fmt.Errorf("add analysis_status: %w", err)
 		}
 	}
-	if _, err := db.Exec(analysisJobsSchema); err != nil {
+	if _, err := db.Exec(analysisJobsSchema + `
+CREATE TABLE IF NOT EXISTS analysis_daily_calls (
+  utc_day TEXT PRIMARY KEY,
+  reserved INTEGER NOT NULL DEFAULT 0
+);`); err != nil {
 		return fmt.Errorf("analysis jobs schema: %w", err)
 	}
 	if _, err := db.Exec(membersSchema); err != nil {
 		return fmt.Errorf("members schema: %w", err)
 	}
 
+	if err := migrateProjectForeignKeys(db); err != nil {
+		return fmt.Errorf("project foreign keys: %w", err)
+	}
+	if oldVersion < 9 {
+		// Older workers could already have contacted the provider while a job
+		// was marked processing. Treat that state as uncertain on upgrade.
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(`UPDATE anomalies SET analysis_status='failed', analysis=message || ' Advisory analysis outcome unknown after upgrade.' WHERE id IN (SELECT anomaly_id FROM analysis_jobs WHERE status='processing')`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err = tx.Exec(`DELETE FROM analysis_jobs WHERE status='processing'`); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS live_batches (
+		id INTEGER PRIMARY KEY,
+		project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		latest_ns INTEGER NOT NULL,
+		records_json BLOB NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_live_batches_expiry ON live_batches(latest_ns);
+	CREATE INDEX IF NOT EXISTS idx_live_batches_project ON live_batches(project_id);`); err != nil {
+		return fmt.Errorf("live journal schema: %w", err)
+	}
+
 	// The alerts table was never written to; drop it rather than carry dead schema.
-	_, _ = db.Exec(`DROP TABLE IF EXISTS alerts`)
-	_, _ = db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion))
-	return nil
+	if _, err := db.Exec(`DROP TABLE IF EXISTS alerts`); err != nil {
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion))
+	return err
 }
 
 type legacySnapshot struct {

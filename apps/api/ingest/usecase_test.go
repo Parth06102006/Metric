@@ -8,6 +8,7 @@ import (
 
 	"traffic-center/domain"
 	"traffic-center/ingest"
+	"traffic-center/internal/projectgate"
 	"traffic-center/metrics"
 	metricsmemory "traffic-center/metrics/repository/memory"
 	"traffic-center/project"
@@ -18,13 +19,14 @@ func setup(t *testing.T) (*ingest.Usecase, *metrics.Usecase, string, string) {
 	t.Helper()
 
 	projects := projectmemory.New()
-	created, err := project.NewUsecase(projects).Create(context.Background(), "Test")
+	admin := domain.WithIdentity(context.Background(), domain.Identity{Email: "admin@example.com", Admin: true})
+	created, err := project.NewUsecase(projects).Create(admin, "Test")
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
 
 	records := metricsmemory.New(60 * time.Second)
-	return ingest.NewUsecase(projects, records), metrics.NewUsecase(records, nil, 60*time.Second), created.ID, created.APIKey
+	return ingest.NewUsecase(projects, records, projectgate.New()), metrics.NewUsecase(records, nil, 60*time.Second), created.ID, created.APIKey
 }
 
 func record() domain.LogRecord {
@@ -67,6 +69,21 @@ func TestIngestRejectsUnknownProject(t *testing.T) {
 
 	if _, err := usecase.Ingest(context.Background(), "missing", apiKey, []domain.LogRecord{record()}); !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("error = %v, want unauthorized", err)
+	}
+}
+
+func TestIngestRejectsOutOfWindowBatchAtomically(t *testing.T) {
+	usecase, metricsUsecase, id, key := setup(t)
+	for _, ts := range []time.Time{time.Now().Add(time.Hour), time.Now().Add(-2 * time.Minute)} {
+		bad := record()
+		bad.Ts = ts
+		if _, err := usecase.Ingest(context.Background(), id, key, []domain.LogRecord{record(), bad}); !errors.Is(err, domain.ErrValidation) {
+			t.Fatalf("timestamp accepted: %v", err)
+		}
+	}
+	snapshot, err := metricsUsecase.Current(context.Background(), id)
+	if err != nil || snapshot.RPS != 0 {
+		t.Fatal("rejected batch was partially ingested")
 	}
 }
 

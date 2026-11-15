@@ -85,7 +85,13 @@ export type Snapshot = {
 
 export type LogRecord = {
     ts: string;
+    /**
+     * Maximum 2048 UTF-8 bytes
+     */
     endpoint: string;
+    /**
+     * Maximum 16 UTF-8 bytes
+     */
     method: string;
     status: number;
     latency_ms?: number;
@@ -222,6 +228,31 @@ export type GetHealthResponses = {
 
 export type GetHealthResponse = GetHealthResponses[keyof GetHealthResponses];
 
+export type GetReadinessData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ready';
+};
+
+export type GetReadinessErrors = {
+    /**
+     * Durable storage or disk is unavailable
+     */
+    503: Error;
+};
+
+export type GetReadinessError = GetReadinessErrors[keyof GetReadinessErrors];
+
+export type GetReadinessResponses = {
+    /**
+     * Durable storage is ready
+     */
+    200: Health;
+};
+
+export type GetReadinessResponse = GetReadinessResponses[keyof GetReadinessResponses];
+
 export type IngestLogsData = {
     body: IngestRequest;
     path: {
@@ -232,6 +263,14 @@ export type IngestLogsData = {
 };
 
 export type IngestLogsErrors = {
+    /**
+     * Live-window capacity or concurrent ingestion limit exceeded; retry later.
+     */
+    429: Error;
+    /**
+     * Low disk space or durable journal unavailable; retry later.
+     */
+    503: Error;
     /**
      * Error response (status varies by failure)
      */

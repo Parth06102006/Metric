@@ -22,7 +22,7 @@ import (
 	"traffic-center/ingest"
 	"traffic-center/internal/analysis"
 	"traffic-center/internal/config"
-	"traffic-center/internal/jev"
+	"traffic-center/internal/projectgate"
 	"traffic-center/internal/server"
 	"traffic-center/internal/sqlite"
 	"traffic-center/internal/ws"
@@ -38,21 +38,21 @@ import (
 // A blocking provider makes the pending-to-completed transition observable
 // without a real API key, network service, sleeps, or provider charges.
 type integrationAnalyst struct {
-	called  chan jev.State
+	called  chan domain.IncidentEvidence
 	release chan struct{}
 }
 
-func (a *integrationAnalyst) Diagnose(ctx context.Context, state jev.State) (jev.Result, error) {
+func (a *integrationAnalyst) Diagnose(ctx context.Context, state domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	select {
 	case a.called <- state:
 	case <-ctx.Done():
-		return jev.Result{}, ctx.Err()
+		return domain.AnalysisResult{}, ctx.Err()
 	}
 	select {
 	case <-a.release:
-		return jev.Result{Pattern: "error_burst", Direction: "more_evidence", Model: "integration-fake", EvidenceProbability: 0.5}, nil
+		return domain.AnalysisResult{Pattern: "error_burst", Direction: "more_evidence", Model: "integration-fake", EvidenceProbability: 0.5}, nil
 	case <-ctx.Done():
-		return jev.Result{}, ctx.Err()
+		return domain.AnalysisResult{}, ctx.Err()
 	}
 }
 
@@ -69,22 +69,23 @@ func TestIntegrationIngestIncidentAnalysisAndWebSocket(t *testing.T) {
 	snapshots := metricssqlite.New(db)
 	incidents := anomalysqlite.New(db)
 	hub := ws.NewHub()
+	gate := projectgate.New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	metricsUsecase := metrics.NewUsecase(records, snapshots, time.Minute)
 	anomalyUsecase := anomaly.NewUsecase(incidents, thresholds, nil, hub, time.Minute)
-	provider := &integrationAnalyst{called: make(chan jev.State, 1), release: make(chan struct{})}
+	provider := &integrationAnalyst{called: make(chan domain.IncidentEvidence, 1), release: make(chan struct{})}
 	analyst := analysis.NewWorker(incidents, provider, snapshots)
 	analyst.SetBroadcaster(hub)
 	analyst.Start()
 	t.Cleanup(analyst.Stop)
 	anomalyUsecase.EnableAsyncAnalysis(100, analyst.Notify)
-	snapshotWorker := anomaly.NewWorker(records, metricsUsecase, snapshots, anomalyUsecase, hub, time.Second, 0, logger)
+	snapshotWorker := anomaly.NewWorker(records, metricsUsecase, snapshots, anomalyUsecase, hub, time.Second, 0, logger, projects, gate)
 
 	cfg := config.Config{AuthMode: "dev", DevEmail: "dev@test", AuthEmailHeader: "X-Auth-Request-Email", AuthUserHeader: "X-Auth-Request-User", MetricsWindow: time.Minute, APITimeout: 5 * time.Second}
 	handler := server.New(cfg, logger, server.Deps{
-		Projects: project.NewUsecase(projects), Lifecycle: project.NewLifecycle(projects, records, hub),
+		Projects: project.NewUsecase(projects), Lifecycle: project.NewLifecycle(projects, records, hub, gate),
 		Thresholds: threshold.NewUsecase(thresholds, projects), Metrics: metricsUsecase,
-		Ingest: ingest.NewUsecase(projects, records), Anomalies: anomalyUsecase,
+		Ingest: ingest.NewUsecase(projects, records, gate), Anomalies: anomalyUsecase,
 		Audit: audit.NewUsecase(auditsqlite.New(db), logger), ProjectRepo: projects, RecordRepo: records, Hub: hub,
 	})
 	srv := httptest.NewServer(handler)

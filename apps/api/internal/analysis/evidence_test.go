@@ -10,16 +10,15 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
 	storesqlite "traffic-center/internal/sqlite"
 	metricssqlite "traffic-center/metrics/repository/sqlite"
 )
 
-type evidenceAnalyst struct{ state jev.State }
+type evidenceAnalyst struct{ state domain.IncidentEvidence }
 
-func (a *evidenceAnalyst) Diagnose(_ context.Context, state jev.State) (jev.Result, error) {
+func (a *evidenceAnalyst) Diagnose(_ context.Context, state domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	a.state = state
-	return jev.Result{Pattern: "error_burst", Direction: "failing_endpoints", EvidenceProbability: 0.9, Model: "fake"}, nil
+	return domain.AnalysisResult{Pattern: "error_burst", Direction: "failing_endpoints", EvidenceProbability: 0.9, Model: "fake"}, nil
 }
 
 func TestAnalysisPreservesAnonymousEvidenceAndUsesNonOverlappingBaseline(t *testing.T) {
@@ -29,6 +28,9 @@ func TestAnalysisPreservesAnonymousEvidenceAndUsesNonOverlappingBaseline(t *test
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	snapshots := metricssqlite.New(db)
 	observed := time.Now().UTC().Truncate(time.Millisecond)
 	for i := 0; i < 13; i++ {
@@ -90,6 +92,9 @@ func TestSuggestionsWithheldForInsufficientEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+				t.Fatal(err)
+			}
 			snapshots := metricssqlite.New(db)
 			now := time.Now().UTC().Truncate(time.Millisecond)
 			for i := 0; i < 12; i++ {
@@ -123,6 +128,9 @@ func TestBaselineRequiresHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	snapshots := metricssqlite.New(db)
 	now := time.Now()
 	if err := snapshots.Save(ctx, "p", domain.Snapshot{Ts: now.Add(-10 * time.Minute)}); err != nil {

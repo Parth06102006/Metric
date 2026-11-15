@@ -20,6 +20,9 @@ func TestSaveWithAnalysisPersistsIncidentAndJobAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p1','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	a := domain.Anomaly{Type: "high_latency", Severity: "high", Message: "slow", Value: 20, Threshold: 10, DetectedAt: time.Now()}
 	snapshot := domain.ComputeAt([]domain.LogRecord{{Endpoint: "/secret", IP: "192.0.2.1", Status: 500, LatencyMs: 100}}, 60, time.Now())

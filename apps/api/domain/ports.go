@@ -5,6 +5,12 @@ import (
 	"time"
 )
 
+// ProjectGate serializes ingestion, deletion and snapshot evaluation per project.
+// Acquire it before repository calls or the stream-access fence; never nest it.
+type ProjectGate interface {
+	Lock(ctx context.Context, projectID string) (unlock func(), err error)
+}
+
 // ProjectRepository persists projects and verifies ingest credentials.
 type ProjectRepository interface {
 	Create(ctx context.Context, project Project, apiKeyHash string) error
@@ -53,7 +59,8 @@ type RecordRepository interface {
 type SnapshotRepository interface {
 	Save(ctx context.Context, projectID string, snapshot Snapshot) error
 	Range(ctx context.Context, projectID string, from, to time.Time, limit int) ([]Snapshot, error)
-	// Recent returns the newest limited snapshots in chronological order.
+	// Recent returns a bounded newest suffix in chronological order; a byte
+	// budget may reduce the count. Range fails closed if its budget is exceeded.
 	Recent(ctx context.Context, projectID string, limit int) ([]Snapshot, error)
 	Prune(ctx context.Context, before time.Time) (int64, error)
 }

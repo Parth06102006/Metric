@@ -23,6 +23,7 @@ import (
 	"traffic-center/domain"
 	"traffic-center/ingest"
 	"traffic-center/internal/config"
+	"traffic-center/internal/projectgate"
 	"traffic-center/internal/server"
 	"traffic-center/internal/sqlite"
 	"traffic-center/internal/ws"
@@ -56,12 +57,13 @@ func newTestServer(t *testing.T) *httptest.Server {
 	snapshotRepo := metricssqlite.New(db)
 	anomalyRepo := anomalysqlite.New(db)
 	hub := ws.NewHub()
+	gate := projectgate.New()
 
 	projectUsecase := project.NewUsecase(projectRepo)
-	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub)
+	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub, gate)
 	thresholdUsecase := threshold.NewUsecase(thresholdRepo, projectRepo)
 	metricsUsecase := metrics.NewUsecase(recordRepo, snapshotRepo, 60*time.Second)
-	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo)
+	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo, gate)
 	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, nil, hub, time.Minute)
 
 	cfg := config.Config{
@@ -346,12 +348,13 @@ func newProxyTestServerWithConfig(t *testing.T, adminEmails []string, configure 
 	snapshotRepo := metricssqlite.New(db)
 	anomalyRepo := anomalysqlite.New(db)
 	hub := ws.NewHub()
+	gate := projectgate.New()
 
 	projectUsecase := project.NewUsecase(projectRepo)
-	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub)
+	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub, gate)
 	thresholdUsecase := threshold.NewUsecase(thresholdRepo, projectRepo)
 	metricsUsecase := metrics.NewUsecase(recordRepo, snapshotRepo, 60*time.Second)
-	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo)
+	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo, gate)
 	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, nil, hub, time.Minute)
 
 	adminsMap := make(map[string]struct{})

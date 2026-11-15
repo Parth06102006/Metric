@@ -8,7 +8,6 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
 	storesqlite "traffic-center/internal/sqlite"
 )
 
@@ -21,13 +20,13 @@ type eventSink struct{ events chan domain.Anomaly }
 func (s *eventSink) BroadcastSnapshot(string, domain.Snapshot)   {}
 func (s *eventSink) BroadcastAnomaly(_ string, a domain.Anomaly) { s.events <- a }
 func (s *eventSink) Drop(string)                                 {}
-func (a *blockingAnalyst) Diagnose(ctx context.Context, state jev.State) (jev.Result, error) {
+func (a *blockingAnalyst) Diagnose(ctx context.Context, state domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	close(a.started)
 	select {
 	case <-a.release:
-		return jev.Result{Pattern: "latency_degradation", Direction: "latency", Model: "fake", EvidenceProbability: 0.8}, nil
+		return domain.AnalysisResult{Pattern: "latency_degradation", Direction: "latency", Model: "fake", EvidenceProbability: 0.8}, nil
 	case <-ctx.Done():
-		return jev.Result{}, ctx.Err()
+		return domain.AnalysisResult{}, ctx.Err()
 	}
 }
 func TestWorkerProcessesQueuedJobWithoutBlockingCaller(t *testing.T) {
@@ -36,6 +35,9 @@ func TestWorkerProcessesQueuedJobWithoutBlockingCaller(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	client := &blockingAnalyst{started: make(chan struct{}), release: make(chan struct{})}
 	w := NewWorker(repo, client, nil)

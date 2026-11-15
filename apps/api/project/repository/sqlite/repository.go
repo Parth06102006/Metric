@@ -235,8 +235,8 @@ func (r *Repository) SetOwner(ctx context.Context, projectID, ownerEmail string)
 }
 
 // Delete removes the project and its dependent data in one transaction.
-// Thresholds also cascade by foreign key, but the explicit deletes do not
-// rely on that pragma being honoured by every connection.
+// Schema v8 also enforces project cascades for snapshots, anomalies and jobs,
+// so direct or concurrent inserts cannot recreate data after deletion.
 func (r *Repository) Delete(ctx context.Context, projectID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {

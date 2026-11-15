@@ -9,15 +9,14 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
 	storesqlite "traffic-center/internal/sqlite"
 )
 
 type countingAnalyst struct{ calls atomic.Int64 }
 
-func (a *countingAnalyst) Diagnose(context.Context, jev.State) (jev.Result, error) {
+func (a *countingAnalyst) Diagnose(context.Context, domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	a.calls.Add(1)
-	return jev.Result{Pattern: "unclear", Direction: "more_evidence", Model: "fake"}, nil
+	return domain.AnalysisResult{Pattern: "unclear", Direction: "more_evidence", Model: "fake"}, nil
 }
 func TestRestartDoesNotDiscardLeasedJobs(t *testing.T) {
 	db, err := storesqlite.Open(filepath.Join(t.TempDir(), "restart.db"))
@@ -25,6 +24,9 @@ func TestRestartDoesNotDiscardLeasedJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	a := domain.Anomaly{Type: "x", Severity: "high", Message: "x", DetectedAt: time.Now()}
 	if err = repo.SaveWithAnalysis(context.Background(), "p", &a, domain.Snapshot{}, 3); err != nil {

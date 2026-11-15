@@ -30,7 +30,8 @@ func TestMetricHistoryAuthorizationAndBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := repo.Save(context.Background(), "other", domain.Snapshot{Ts: base.Add(1000 * time.Second), RPS: 9999, Endpoints: map[string]int{}}); err != nil {
+	other := createProjectAs(t, srv.URL, admin, "Other metrics")
+	if err := repo.Save(context.Background(), other.ProjectID, domain.Snapshot{Ts: base.Add(1000 * time.Second), RPS: 9999, Endpoints: map[string]int{}}); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {

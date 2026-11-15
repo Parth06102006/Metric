@@ -20,6 +20,9 @@ func TestAnalysisJobLeaseAndCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	a := domain.Anomaly{Type: "high_latency", Severity: "high", Message: "slow", DetectedAt: time.Now()}
 	if err := repo.SaveWithAnalysis(ctx, "p", &a, domain.Snapshot{}, 10); err != nil {
@@ -69,6 +72,9 @@ func TestAnalysisFailureAndDeleteDoNotLeaveJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('p','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := anomalysqlite.New(db)
 	a := domain.Anomaly{Type: "x", Severity: "high", Message: "rule", DetectedAt: time.Now()}
 	if err = repo.SaveWithAnalysis(ctx, "p", &a, domain.Snapshot{}, 5); err != nil {

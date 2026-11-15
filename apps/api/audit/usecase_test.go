@@ -81,25 +81,42 @@ func TestLogNeverFailsTheRequestOnWriteError(t *testing.T) {
 	}
 }
 
+func TestListRequiresAdmin(t *testing.T) {
+	usecase := audit.NewUsecase(memory.New(), nil)
+	for _, tc := range []struct {
+		ctx  context.Context
+		want error
+	}{
+		{context.Background(), domain.ErrUnauthorized},
+		{domain.WithIdentity(context.Background(), domain.Identity{Admin: true}), domain.ErrUnauthorized},
+		{domain.WithIdentity(context.Background(), domain.Identity{Email: "viewer@example.com"}), domain.ErrForbidden},
+	} {
+		if _, err := usecase.List(tc.ctx, domain.AuditQuery{}); !errors.Is(err, tc.want) {
+			t.Fatalf("got %v want %v", err, tc.want)
+		}
+	}
+}
+
 func TestListBoundsLimit(t *testing.T) {
 	repo := &spyRepo{Repository: memory.New()}
 	usecase := audit.NewUsecase(repo, nil)
+	ctx := domain.WithIdentity(context.Background(), domain.Identity{Email: "admin@example.com", Admin: true})
 
-	if _, err := usecase.List(context.Background(), domain.AuditQuery{}); err != nil {
+	if _, err := usecase.List(ctx, domain.AuditQuery{}); err != nil {
 		t.Fatalf("List(zero): %v", err)
 	}
 	if repo.lastQuery.Limit != 100 {
 		t.Fatalf("default limit = %d, want 100", repo.lastQuery.Limit)
 	}
 
-	if _, err := usecase.List(context.Background(), domain.AuditQuery{Limit: audit.MaxListSize + 1}); err != nil {
+	if _, err := usecase.List(ctx, domain.AuditQuery{Limit: audit.MaxListSize + 1}); err != nil {
 		t.Fatalf("List(over max): %v", err)
 	}
 	if repo.lastQuery.Limit != 100 {
 		t.Fatalf("oversized limit = %d, want clamped to 100", repo.lastQuery.Limit)
 	}
 
-	if _, err := usecase.List(context.Background(), domain.AuditQuery{Limit: 25}); err != nil {
+	if _, err := usecase.List(ctx, domain.AuditQuery{Limit: 25}); err != nil {
 		t.Fatalf("List(25): %v", err)
 	}
 	if repo.lastQuery.Limit != 25 {
@@ -110,7 +127,7 @@ func TestListBoundsLimit(t *testing.T) {
 func TestListFiltersByActionProjectAndCursor(t *testing.T) {
 	repo := memory.New()
 	usecase := audit.NewUsecase(repo, nil)
-	ctx := context.Background()
+	ctx := domain.WithIdentity(context.Background(), domain.Identity{Email: "admin@example.com", Admin: true})
 
 	now := time.Now().UTC()
 	for _, event := range []domain.AuditEvent{

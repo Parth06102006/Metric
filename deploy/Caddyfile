@@ -1,5 +1,5 @@
 {
-	email {$ACME_EMAIL}
+	{$CADDY_ACME_OPTION}
 }
 
 # SITE_ADDRESS is a hostname (metrics.example.com) in production, or :80 for a
@@ -31,41 +31,54 @@
 		reverse_proxy oauth2-proxy:4180
 	}
 
-	# Live stream. Authenticate at the handshake, then stream without buffering.
+	# Live stream. Authenticate every handshake. The Go handler ends streams
+	# after five minutes (regardless of pongs), forcing reconnect through this
+	# SSO check. Provider revocation visibility still depends on proxy refresh.
+	# No buffering on the upgraded connection.
 	handle /ws/* {
-		forward_auth oauth2-proxy:4180 {
-			uri /oauth2/auth
-			# A client must never be able to assert trusted identity headers.
-			# They are stripped from the incoming request before the auth
-			# endpoint sees it; copy_headers then sets the verified values
-			# from the SSO session. If the session yields no identity, the
-			# headers stay absent and the Go API fails closed with 401.
-			header_up -X-Auth-Request-Email
-			header_up -X-Auth-Request-User
-			header_up -X-Proxy-Secret
-			copy_headers X-Auth-Request-Email X-Auth-Request-User
-		}
-		reverse_proxy api:8080 {
-			header_up Host {host}
-			header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
-			flush_interval -1
+		route {
+			request_header -X-Auth-Request-Email
+			request_header -X-Auth-Request-User
+			request_header -X-Proxy-Secret
+			forward_auth oauth2-proxy:4180 {
+				uri /oauth2/auth
+				# A client must never be able to assert trusted identity headers.
+				# The outer request_header directives strip client identity before
+				# the auth check; copy_headers then sets the verified values
+				# from the SSO session. If the session yields no identity, the
+				# headers stay absent and the Go API fails closed with 401.
+				header_up -X-Auth-Request-Email
+				header_up -X-Auth-Request-User
+				header_up -X-Proxy-Secret
+				copy_headers X-Auth-Request-Email X-Auth-Request-User
+			}
+			reverse_proxy api:8080 {
+				header_up Host {host}
+				header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
+				flush_interval -1
+			}
 		}
 	}
 
 	# Control plane. Unauthenticated requests receive 401 from oauth2-proxy.
 	handle /api/* {
-		forward_auth oauth2-proxy:4180 {
-			uri /oauth2/auth
-			# Same spoofing protection as /ws: identity comes only from the
-			# verified SSO session, never from the client.
-			header_up -X-Auth-Request-Email
-			header_up -X-Auth-Request-User
-			header_up -X-Proxy-Secret
-			copy_headers X-Auth-Request-Email X-Auth-Request-User
-		}
-		reverse_proxy api:8080 {
-			header_up Host {host}
-			header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
+		route {
+			request_header -X-Auth-Request-Email
+			request_header -X-Auth-Request-User
+			request_header -X-Proxy-Secret
+			forward_auth oauth2-proxy:4180 {
+				uri /oauth2/auth
+				# Same spoofing protection as /ws: identity comes only from the
+				# verified SSO session, never from the client.
+				header_up -X-Auth-Request-Email
+				header_up -X-Auth-Request-User
+				header_up -X-Proxy-Secret
+				copy_headers X-Auth-Request-Email X-Auth-Request-User
+			}
+			reverse_proxy api:8080 {
+				header_up Host {host}
+				header_up X-Proxy-Secret {$PROXY_SHARED_SECRET}
+			}
 		}
 	}
 

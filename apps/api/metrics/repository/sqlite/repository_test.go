@@ -18,6 +18,9 @@ func TestRecentHistoryPersistsAndLimitsNewestWithoutChangingRange(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('a','a','hash'),('b','b','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	repo := sqlite.New(db)
 	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	// Deliberately insert out of order; same-timestamp ties use insertion order.

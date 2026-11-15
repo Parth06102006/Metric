@@ -19,8 +19,18 @@ services:
       WORKER_INTERVAL: ${WORKER_INTERVAL:-5s}
       SNAPSHOT_RETENTION: ${SNAPSHOT_RETENTION:-168h}
       AUDIT_RETENTION: ${AUDIT_RETENTION:-2160h}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      JEV_MODEL: ${JEV_MODEL:-typesafe/jev-1.14}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-decision-1}
+      GEMINI_MAX_DAILY_CALLS: ${GEMINI_MAX_DAILY_CALLS:-100}
+      MAX_PROJECT_RECORDS: ${MAX_PROJECT_RECORDS:-50000}
+      MAX_PROJECT_ENDPOINTS: ${MAX_PROJECT_ENDPOINTS:-512}
+      MAX_TOTAL_RECORDS: ${MAX_TOTAL_RECORDS:-200000}
+      MAX_LIVE_PROJECTS: ${MAX_LIVE_PROJECTS:-512}
+      MAX_PROJECT_BYTES: ${MAX_PROJECT_BYTES:-16777216}
+      MAX_TOTAL_BYTES: ${MAX_TOTAL_BYTES:-67108864}
+      INGEST_CONCURRENCY: ${INGEST_CONCURRENCY:-16}
+      SQLITE_MAX_BYTES: ${SQLITE_MAX_BYTES:-2147483648}
+      MIN_FREE_DISK_BYTES: ${MIN_FREE_DISK_BYTES:-268435456}
     volumes:
       - metric-data:/data
     healthcheck:
@@ -62,7 +72,7 @@ services:
         condition: service_started
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
-      ACME_EMAIL: ${ACME_EMAIL:-}
+      CADDY_ACME_OPTION: ${ACME_EMAIL:+email ${ACME_EMAIL}}
       PROXY_SHARED_SECRET: ${PROXY_SHARED_SECRET:?set PROXY_SHARED_SECRET in .env}
     ports:
       - "80:80"
@@ -73,10 +83,64 @@ services:
     networks:
       - internal
 
+  # Opt-in operations stack; credentials are never passed to the API.
+  metric-ops:
+    profiles: ["ops"]
+    build:
+      context: ./apps/api
+    entrypoint: ["/metric-ops"]
+    command: ["serve"]
+    restart: unless-stopped
+    environment:
+      DATABASE_PATH: /data/traffic.db
+      API_READY_URL: http://api:8080/ready
+      BACKUP_WORK_DIR: /data
+      BACKUP_INTERVAL: ${BACKUP_INTERVAL:-1h}
+      BACKUP_TIMEOUT: ${BACKUP_TIMEOUT:-50m}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_PREFIX: ${R2_PREFIX:-metric/}
+    volumes:
+      - metric-data:/data
+    networks:
+      - internal
+
+  node-exporter:
+    profiles: ["ops"]
+    image: prom/node-exporter:v1.9.1
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["--collector.disable-defaults", "--collector.filesystem"]
+    volumes:
+      - metric-data:/data:ro
+    networks:
+      - internal
+
+  alloy:
+    profiles: ["ops"]
+    image: grafana/alloy:v1.11.3
+    restart: unless-stopped
+    command: ["run", "--server.http.listen-addr=127.0.0.1:12345", "--storage.path=/var/lib/alloy", "/etc/alloy/config.alloy"]
+    environment:
+      GRAFANA_REMOTE_WRITE_URL: ${GRAFANA_REMOTE_WRITE_URL:-}
+      GRAFANA_REMOTE_WRITE_USER: ${GRAFANA_REMOTE_WRITE_USER:-}
+      GRAFANA_REMOTE_WRITE_PASSWORD: ${GRAFANA_REMOTE_WRITE_PASSWORD:-}
+      METRIC_DEPLOYMENT: ${METRIC_DEPLOYMENT:-metric}
+    volumes:
+      - ./deploy/monitoring/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy-data:/var/lib/alloy
+    networks:
+      - internal
+
 networks:
   internal:
 
 volumes:
   metric-data:
+  alloy-data:
   caddy-data:
   caddy-config:

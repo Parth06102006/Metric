@@ -28,6 +28,27 @@ func IdentityFrom(ctx context.Context) (Identity, bool) {
 	return id, ok
 }
 
+// RequireIdentity fails closed when a trusted caller identity is missing.
+func RequireIdentity(ctx context.Context) (Identity, error) {
+	id, ok := IdentityFrom(ctx)
+	if !ok || strings.TrimSpace(id.Email) == "" {
+		return Identity{}, ErrUnauthorized
+	}
+	return id, nil
+}
+
+// RequireAdmin requires an authenticated identity with administrator privileges.
+func RequireAdmin(ctx context.Context) (Identity, error) {
+	id, err := RequireIdentity(ctx)
+	if err != nil {
+		return Identity{}, err
+	}
+	if !id.Admin {
+		return Identity{}, ErrForbidden
+	}
+	return id, nil
+}
+
 // ValidateEmail checks an owner email. An empty email is valid and means the
 // project has no owner, which only admins can access. This is a shape check,
 // not a deliverability check: the trusted identity proxy already verified the

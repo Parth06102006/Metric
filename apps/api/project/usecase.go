@@ -22,6 +22,10 @@ func NewUsecase(repo domain.ProjectRepository) *Usecase {
 // Create validates the name, mints an ID and an API key, and persists the
 // hash. The plaintext key is returned to the caller exactly once.
 func (u *Usecase) Create(ctx context.Context, name string) (domain.ProjectWithKey, error) {
+	identity, err := domain.RequireAdmin(ctx)
+	if err != nil {
+		return domain.ProjectWithKey{}, err
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return domain.ProjectWithKey{}, domain.Validationf("project name is required")
@@ -40,12 +44,7 @@ func (u *Usecase) Create(ctx context.Context, name string) (domain.ProjectWithKe
 		return domain.ProjectWithKey{}, err
 	}
 
-	var ownerEmail string
-	if identity, ok := domain.IdentityFrom(ctx); ok {
-		ownerEmail = identity.Email
-	}
-
-	project := domain.Project{ID: id, Name: name, OwnerEmail: ownerEmail}
+	project := domain.Project{ID: id, Name: name, OwnerEmail: identity.Email}
 	if err := u.repo.Create(ctx, project, domain.HashAPIKey(key)); err != nil {
 		return domain.ProjectWithKey{}, err
 	}
@@ -53,9 +52,12 @@ func (u *Usecase) Create(ctx context.Context, name string) (domain.ProjectWithKe
 	return domain.ProjectWithKey{Project: project, APIKey: key}, nil
 }
 
-// Get returns a project or domain.ErrNotFound. If caller identity is present,
-// it enforces that only the owner or an admin may access the project.
+// Get returns a project only to an authenticated owner, viewer or admin.
 func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Project, error) {
+	identity, err := domain.RequireIdentity(ctx)
+	if err != nil {
+		return domain.Project{}, err
+	}
 	if strings.TrimSpace(projectID) == "" {
 		return domain.Project{}, domain.Validationf("project id is required")
 	}
@@ -63,7 +65,7 @@ func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Project, er
 	if err != nil {
 		return domain.Project{}, err
 	}
-	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
+	if !p.CanAccess(identity) {
 		return domain.Project{}, domain.ErrAccessDenied
 	}
 	return p, nil
@@ -71,11 +73,17 @@ func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Project, er
 
 // KnownUsers lists identities observed at a trusted sign-in; delivery is admin-only.
 func (u *Usecase) KnownUsers(ctx context.Context) ([]string, error) {
+	if _, err := domain.RequireAdmin(ctx); err != nil {
+		return nil, err
+	}
 	return u.repo.ListUsers(ctx)
 }
 
 // Viewers returns project members; delivery is admin-only.
 func (u *Usecase) Viewers(ctx context.Context, projectID string) ([]string, error) {
+	if _, err := domain.RequireAdmin(ctx); err != nil {
+		return nil, err
+	}
 	if _, err := u.repo.Get(ctx, projectID); err != nil {
 		return nil, err
 	}
@@ -85,8 +93,11 @@ func (u *Usecase) Viewers(ctx context.Context, projectID string) ([]string, erro
 // List returns projects accessible to the caller. Admins see all projects
 // (including legacy ownerless projects); non-admins see only projects they own.
 func (u *Usecase) List(ctx context.Context) ([]domain.Project, error) {
-	identity, ok := domain.IdentityFrom(ctx)
-	if !ok || identity.Admin {
+	identity, err := domain.RequireIdentity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if identity.Admin {
 		return u.repo.List(ctx)
 	}
 	return u.repo.ListByOwner(ctx, identity.Email)

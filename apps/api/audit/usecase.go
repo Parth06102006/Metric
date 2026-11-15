@@ -78,6 +78,9 @@ func (u *Usecase) Log(ctx context.Context, actorEmail, action, targetProjectID, 
 // List returns matching audit events, newest first. An out-of-range limit falls
 // back to the default page size so a bad query string cannot drain the table.
 func (u *Usecase) List(ctx context.Context, query domain.AuditQuery) ([]domain.AuditEvent, error) {
+	if _, err := domain.RequireAdmin(ctx); err != nil {
+		return nil, err
+	}
 	if query.Limit <= 0 || query.Limit > MaxListSize {
 		query.Limit = 100
 	}

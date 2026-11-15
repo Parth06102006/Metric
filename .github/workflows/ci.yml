@@ -43,6 +43,38 @@ jobs:
       - name: Build API
         run: make api-build
 
+  operations:
+    name: Backup and monitoring configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/api/go.mod
+          cache-dependency-path: apps/api/go.sum
+      - name: Validate and test alert rules
+        run: |
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/deploy/monitoring:/work/deploy/monitoring:ro" \
+            -v "$PWD/tests/monitoring:/work/tests/monitoring:ro" \
+            prom/prometheus:v3.5.0 test rules /work/tests/monitoring/alerts-test.yaml
+      - name: Validate Alloy configuration
+        run: |
+          docker run --rm \
+            -e GRAFANA_REMOTE_WRITE_URL=https://prometheus.example.com/api/prom/push \
+            -e GRAFANA_REMOTE_WRITE_USER=test -e GRAFANA_REMOTE_WRITE_PASSWORD=test \
+            -e METRIC_DEPLOYMENT=test \
+            -v "$PWD/deploy/monitoring/config.alloy:/etc/alloy/config.alloy:ro" \
+            grafana/alloy:v1.11.3 validate /etc/alloy/config.alloy
+          python3 -m json.tool deploy/monitoring/dashboard.json >/dev/null
+      - name: Test isolated metrics pipeline
+        run: bash tests/monitoring/docker-smoke.sh
+      - name: Build and test operations container
+        run: |
+          docker build -t metric-ci-ops:temporary apps/api
+          METRIC_TEST_IMAGE=metric-ci-ops:temporary bash tests/monitoring/container-smoke.sh
+
   performance-smoke:
     name: k6 smoke
     runs-on: ubuntu-latest

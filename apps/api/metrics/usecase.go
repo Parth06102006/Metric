@@ -9,9 +9,10 @@ import (
 
 // Usecase computes the current snapshot and reads historical ones.
 type Usecase struct {
-	records   domain.RecordRepository
-	snapshots domain.SnapshotRepository
-	window    time.Duration
+	records      domain.RecordRepository
+	snapshots    domain.SnapshotRepository
+	window       time.Duration
+	currentSlots chan struct{}
 }
 
 // NewUsecase wires the metrics usecase. A non-positive window falls back to 60s.
@@ -19,7 +20,7 @@ func NewUsecase(records domain.RecordRepository, snapshots domain.SnapshotReposi
 	if window <= 0 {
 		window = 60 * time.Second
 	}
-	return &Usecase{records: records, snapshots: snapshots, window: window}
+	return &Usecase{records: records, snapshots: snapshots, window: window, currentSlots: make(chan struct{}, 8)}
 }
 
 // Window returns the configured rolling window.
@@ -29,6 +30,16 @@ func (u *Usecase) Window() time.Duration {
 
 // Current computes a snapshot over the live rolling window.
 func (u *Usecase) Current(ctx context.Context, projectID string) (domain.Snapshot, error) {
+	// Snapshot computation copies and sorts whole windows; bound concurrent
+	// consumers, including WebSocket handshakes and background evaluation.
+	select {
+	case u.currentSlots <- struct{}{}:
+		defer func() { <-u.currentSlots }()
+	case <-ctx.Done():
+		return domain.Snapshot{}, ctx.Err()
+	default:
+		return domain.Snapshot{}, domain.ErrCapacity
+	}
 	records, err := u.records.Recent(ctx, projectID, time.Now().Add(-u.window))
 	if err != nil {
 		return domain.Snapshot{}, err

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.27.3-alpine AS build
+FROM golang:1.27.4-alpine AS build
 
 WORKDIR /src
 
@@ -14,7 +14,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/metric-api \
-    ./app
+    ./app \
+    && CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/metric-ops \
+    ./cmd/metric-ops
 
 # A named volume inherits the ownership of the image directory it covers. The
 # API runs as nonroot, so create the mount point with that ownership here.
@@ -23,6 +28,7 @@ RUN mkdir -p /out/data && touch /out/data/.keep
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/metric-api /metric-api
+COPY --from=build /out/metric-ops /metric-ops
 COPY --from=build --chown=65532:65532 /out/data /data
 
 EXPOSE 8080

@@ -9,20 +9,20 @@ import (
 
 	anomalysqlite "traffic-center/anomaly/repository/sqlite"
 	"traffic-center/domain"
-	"traffic-center/internal/jev"
+	"traffic-center/internal/gemini"
 	storesqlite "traffic-center/internal/sqlite"
 	metricssqlite "traffic-center/metrics/repository/sqlite"
 )
 
 type observedLiveAnalyst struct {
-	client  *jev.Client
+	client  *gemini.Client
 	calls   int
 	elapsed time.Duration
-	result  jev.Result
+	result  domain.AnalysisResult
 	err     error
 }
 
-func (a *observedLiveAnalyst) Diagnose(ctx context.Context, state jev.State) (jev.Result, error) {
+func (a *observedLiveAnalyst) Diagnose(ctx context.Context, state domain.IncidentEvidence) (domain.AnalysisResult, error) {
 	a.calls++
 	start := time.Now()
 	a.result, a.err = a.client.Diagnose(ctx, state)
@@ -32,13 +32,13 @@ func (a *observedLiveAnalyst) Diagnose(ctx context.Context, state jev.State) (je
 
 // Opt-in only: this test sends one synthetic, aggregate-only, potentially
 // billable request to the real provider. It never prints credentials.
-func TestLiveJevIncidentAnalysis(t *testing.T) {
-	if os.Getenv("JEV_LIVE_TEST") != "1" {
-		t.Skip("set JEV_LIVE_TEST=1 and OPENROUTER_API_KEY to run one billable live provider request")
+func TestLiveGeminiIncidentAnalysis(t *testing.T) {
+	if os.Getenv("GEMINI_LIVE_TEST") != "1" {
+		t.Skip("set GEMINI_LIVE_TEST=1 and GEMINI_API_KEY to run one billable live provider request")
 	}
-	key := os.Getenv("OPENROUTER_API_KEY")
+	key := os.Getenv("GEMINI_API_KEY")
 	if key == "" {
-		t.Fatal("OPENROUTER_API_KEY is required for the live test")
+		t.Fatal("GEMINI_API_KEY is required for the live test")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -47,6 +47,9 @@ func TestLiveJevIncidentAnalysis(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if _, err := db.Exec(`INSERT INTO projects(id,name,api_key_hash) VALUES ('synthetic','test','hash')`); err != nil {
+		t.Fatal(err)
+	}
 	snapshots := metricssqlite.New(db)
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	for i := 0; i < 13; i++ {
@@ -66,11 +69,11 @@ func TestLiveJevIncidentAnalysis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	model := os.Getenv("JEV_MODEL")
+	model := os.Getenv("GEMINI_MODEL")
 	if model == "" {
-		model = "typesafe/jev-1.14"
+		model = gemini.DefaultModel
 	} // Match config.Load's application default.
-	provider := &observedLiveAnalyst{client: jev.New(key, model)}
+	provider := &observedLiveAnalyst{client: gemini.New(key, model)}
 	NewWorker(repo, provider, snapshots).process(ctx, job)
 	if provider.calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", provider.calls)

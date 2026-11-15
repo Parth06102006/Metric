@@ -7,7 +7,7 @@ const features = [
   { title: "Send your traffic", body: "Your services send request logs using a project-specific ingest key." },
   { title: "See the shape of traffic", body: "Live request rates, latency and error rates reveal how your API is behaving." },
   { title: "Know when things change", body: "Threshold rules surface anomalies while keeping alert severity deterministic." },
-  { title: "Investigate with context", body: "Optional Jev analysis provides advisory context alongside the alert." },
+  { title: "Investigate with context", body: "Optional Gemini Decisions analysis provides advisory context alongside the alert." },
 ];
 
 gsap.registerPlugin(ScrollTrigger);

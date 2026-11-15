@@ -22,7 +22,7 @@ repos:
         name: Go lint
         # Run the whole module without --fix, including for config changes.
         entry: bash -c 'cd apps/api && golangci-lint run --config ../../.golangci.yml ./...'
-        language_version: 1.27.3
+        language_version: 1.27.4
         types: [file]
         files: ^(apps/api/(.*\.go|go\.(mod|sum))|\.golangci\.yml)$
 

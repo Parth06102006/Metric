@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
@@ -33,6 +35,7 @@ type Deps struct {
 	ProjectRepo domain.ProjectRepository
 	RecordRepo  domain.RecordRepository
 	Hub         *ws.Hub
+	Readiness   interface{ Ready(context.Context) error }
 }
 
 // New builds the complete HTTP handler.
@@ -71,12 +74,24 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 	anomalyHandler := rest.NewAnomalyHandler(deps.Projects, deps.Anomalies, deps.Audit)
 	ingestHandler := rest.NewIngestHandler(deps.Ingest, deps.Audit)
 	auditHandler := rest.NewAuditHandler(deps.Audit)
-	wsHandler := ws.NewHandler(deps.ProjectRepo, deps.RecordRepo, deps.Hub, cfg.MetricsWindow, cfg.AllowedOrigins, logger, deps.Audit)
+	wsHandler := ws.NewHandler(deps.ProjectRepo, deps.RecordRepo, deps.Hub, cfg.MetricsWindow, cfg.AllowedOrigins, logger, deps.Audit, deps.Metrics)
 
 	// Public realm: liveness and machine ingest (X-API-Key), no SSO.
 	router.Get("/health", healthHandler.Health)
-	router.Post("/ingest/{projectID}", ingestHandler.Ingest)
+	// Liveness stays independent; readiness checks the durable ingest store.
+	router.Get("/ready", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if deps.Readiness == nil || deps.Readiness.Ready(ctx) != nil {
+			httpx.JSON(w, http.StatusServiceUnavailable, httpx.ErrorResponse{Error: "not ready"})
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	})
+	router.With(middleware.IngestAdmission(cfg.IngestConcurrency, cfg.APITimeout)).Post("/ingest/{projectID}", ingestHandler.Ingest)
 
+	// Bound concurrent metrics response allocation and encoding across routes.
+	metricsAdmission := middleware.IngestAdmission(4, cfg.APITimeout)
 	// Control plane: trusted identity from the edge proxy.
 	router.Route("/api", func(r chi.Router) {
 		r.Use(identity)
@@ -90,8 +105,8 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		r.Get("/projects/{projectID}", projectHandler.Get)
 		r.Get("/projects/{projectID}/thresholds", thresholdHandler.Get)
 		r.With(middleware.RequireAdminWith(deps.Audit)).Put("/projects/{projectID}/thresholds", thresholdHandler.Update)
-		r.Get("/projects/{projectID}/metrics", metricsHandler.Get)
-		r.Get("/projects/{projectID}/metrics/history", metricsHandler.History)
+		r.With(metricsAdmission).Get("/projects/{projectID}/metrics", metricsHandler.Get)
+		r.With(metricsAdmission).Get("/projects/{projectID}/metrics/history", metricsHandler.History)
 		r.Get("/projects/{projectID}/anomalies", anomalyHandler.List)
 
 		// Admin-only project viewer management.
@@ -109,7 +124,8 @@ func New(cfg config.Config, logger *slog.Logger, deps Deps) http.Handler {
 		r.With(middleware.RequireAdminWith(deps.Audit)).Get("/audit", auditHandler.List)
 	})
 
-	// Live stream: identity at handshake, no request timeout.
+	// Live stream: identity at every handshake; the WS handler bounds each
+	// connection's authentication lifetime independently of the API timeout.
 	router.Route("/ws", func(r chi.Router) {
 		r.Use(identity)
 		r.Get("/{projectID}", wsHandler.ServeHTTP)

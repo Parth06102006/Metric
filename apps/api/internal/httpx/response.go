@@ -45,6 +45,12 @@ func Error(w http.ResponseWriter, r *http.Request, err error) {
 		status, message = http.StatusUnauthorized, "unauthorized"
 	case errors.Is(err, domain.ErrForbidden):
 		status, message = http.StatusForbidden, "forbidden"
+	case errors.Is(err, domain.ErrStorageUnavailable):
+		status, message = http.StatusServiceUnavailable, "storage unavailable; retry later"
+		w.Header().Set("Retry-After", "5")
+	case errors.Is(err, domain.ErrCapacity):
+		status, message = http.StatusTooManyRequests, "capacity exceeded; retry later"
+		w.Header().Set("Retry-After", "1")
 	case errors.Is(err, domain.ErrConflict):
 		status, message = http.StatusConflict, "conflict"
 	}

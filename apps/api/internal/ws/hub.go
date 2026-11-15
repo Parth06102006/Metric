@@ -150,7 +150,10 @@ func (h *Hub) Broadcast(projectID string, event Envelope) {
 		case client.send <- message:
 		case <-client.done:
 		default:
-			// Client is full: drop this event instead of stalling the worker.
+			// A full queue means the client's view is no longer complete. Close
+			// and unregister it so reconnect refetches durable incident/history
+			// state instead of silently continuing across a missing event.
+			h.Unregister(projectID, client)
 		}
 	}
 }

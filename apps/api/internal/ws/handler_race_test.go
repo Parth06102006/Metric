@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"traffic-center/domain"
+	"traffic-center/internal/projectgate"
 	"traffic-center/internal/ws"
 	metricsmemory "traffic-center/metrics/repository/memory"
 	"traffic-center/project"
@@ -47,7 +48,7 @@ func (r *delayedProjectLookup) Get(ctx context.Context, id string) (domain.Proje
 func TestWebSocketRechecksAccessAfterConcurrentProjectChange(t *testing.T) {
 	for _, change := range []string{"reassign", "delete", "remove-viewer"} {
 		t.Run(change, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := domain.WithIdentity(context.Background(), domain.Identity{Email: "admin@example.com", Admin: true})
 			projects := projectmemory.New()
 			records := metricsmemory.New(time.Minute)
 			hub := ws.NewHub()
@@ -55,7 +56,7 @@ func TestWebSocketRechecksAccessAfterConcurrentProjectChange(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lifecycle := project.NewLifecycle(projects, records, hub)
+			lifecycle := project.NewLifecycle(projects, records, hub, projectgate.New())
 			owner := "alice@example.com"
 			if change == "remove-viewer" {
 				owner = "bob@example.com"

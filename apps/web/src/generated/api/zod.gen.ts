@@ -75,12 +75,12 @@ export const zSnapshot = z.object({
 
 export const zLogRecord = z.object({
     ts: z.iso.datetime({ offset: true }),
-    endpoint: z.string().min(1),
-    method: z.string().min(1),
+    endpoint: z.string().min(1).max(2048),
+    method: z.string().min(1).max(16),
     status: z.int().gte(100).lte(599),
-    latency_ms: z.number().gte(0).optional(),
+    latency_ms: z.number().gte(0).lte(86400000).optional(),
     ip: z.string(),
-    payload_bytes: z.int().gte(0).optional()
+    payload_bytes: z.int().gte(0).lte(1099511627776).optional()
 });
 
 export const zIngestRequest = z.object({
@@ -191,6 +191,11 @@ export const zProjectId = z.string();
  * Process is running
  */
 export const zGetHealthResponse = zHealth;
+
+/**
+ * Durable storage is ready
+ */
+export const zGetReadinessResponse = zHealth;
 
 export const zIngestLogsBody = zIngestRequest;
 

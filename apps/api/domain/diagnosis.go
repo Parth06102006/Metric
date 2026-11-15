@@ -1,6 +1,20 @@
 package domain
 
-import "time"
+import (
+	"context"
+	"time"
+)
+
+// Analyst is the provider-neutral port for asynchronous advisory decisions.
+type Analyst interface {
+	Diagnose(context.Context, IncidentEvidence) (AnalysisResult, error)
+}
+
+type AnalysisResult struct {
+	Pattern, Direction, Model                                                               string
+	Urgency, PatternConfidence, DirectionConfidence, UrgencyConfidence, EvidenceProbability float64
+	InputTokens                                                                             int
+}
 
 // IncidentEvidence contains only aggregate measurements; no raw paths or IPs.
 // Optional fields are absent when older queued jobs lack the data.
@@ -41,6 +55,12 @@ type BaselineEvidence struct {
 	RPS       float64   `json:"rps"`
 	P95       float64   `json:"p95"`
 	ErrorRate float64   `json:"error_rate"`
+}
+
+// EvidenceSufficient is the conservative product gate, not proof of accuracy.
+func EvidenceSufficient(state IncidentEvidence, result AnalysisResult) bool {
+	endpointSupported := result.Direction != "failing_endpoints" || (state.Endpoints != nil && state.Endpoints.MostErrors > 0)
+	return state.Baseline != nil && state.RequestCount != nil && *state.RequestCount >= 20 && result.EvidenceProbability >= 0.7 && result.Pattern != "unclear" && result.Direction != "more_evidence" && endpointSupported
 }
 
 // Diagnosis is advisory. Its probabilities and scores are not proof of correctness.

@@ -419,7 +419,7 @@ export function ProjectDetail() {
                       {anomaly.diagnosis.evidence_sufficient ? (
                         <p>
                           Pattern: {anomaly.diagnosis.pattern.replaceAll("_", " ")}; investigate: {anomaly.diagnosis.direction.replaceAll("_", " ")}.
-                          Jev urgency: {formatNumber(anomaly.diagnosis.urgency, 1)} / 2; alert severity is unchanged.
+                          Advisory urgency: {formatNumber(anomaly.diagnosis.urgency, 1)} / 2; alert severity is unchanged.
                         </p>
                       ) : (
                         <p>Insufficient context for a suggested investigation.</p>

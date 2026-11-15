@@ -20,6 +20,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Health' }
+  /ready:
+    get:
+      operationId: getReadiness
+      description: Point-in-time durable storage and disk readiness; does not prove all workers or external services are healthy.
+      responses:
+        '200':
+          description: Durable storage is ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Durable storage or disk is unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /ingest/{projectID}:
     parameters:
       - $ref: '#/components/parameters/ProjectID'
@@ -27,7 +42,14 @@ paths:
       operationId: ingestLogs
       security:
         - ingestKey: []
-      description: Accepts 1–1000 records; the JSON body is limited to 1 MiB.
+      description: |
+        Accepts 1–1000 records, up to 1 MiB. Timestamps must be within the
+        configured live window and no more than five seconds ahead; small
+        future skew is clamped to server time. A 202 follows a SQLite journal
+        commit; live records are recovered after restart while still in the
+        window. Capacity overload returns 429, and low disk or a journal failure
+        returns 503; retry with backoff. A lost response or uncertain commit can
+        result in duplicates on retry (there is no idempotency key).
       requestBody:
         required: true
         content:
@@ -39,6 +61,22 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/IngestResponse' }
+        '429':
+          description: Live-window capacity or concurrent ingestion limit exceeded; retry later.
+          headers:
+            Retry-After:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Low disk space or durable journal unavailable; retry later.
+          headers:
+            Retry-After:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         default: { $ref: '#/components/responses/Error' }
   /api/auth/me:
     get:
@@ -227,7 +265,7 @@ paths:
       - $ref: '#/components/parameters/ProjectID'
     get:
       operationId: getMetricHistory
-      description: The newest 900 persisted snapshots for an accessible project, in chronological order.
+      description: Up to the newest 900 persisted snapshots, in chronological order; a 4 MiB endpoint-data budget may reduce the returned count.
       responses:
         '200':
           description: Recent persisted snapshots (empty if none exist)
@@ -387,12 +425,12 @@ components:
       required: [ts, endpoint, method, status, ip]
       properties:
         ts: { type: string, format: date-time }
-        endpoint: { type: string, minLength: 1 }
-        method: { type: string, minLength: 1 }
+        endpoint: { type: string, minLength: 1, maxLength: 2048, description: Maximum 2048 UTF-8 bytes }
+        method: { type: string, minLength: 1, maxLength: 16, description: Maximum 16 UTF-8 bytes }
         status: { type: integer, minimum: 100, maximum: 599 }
-        latency_ms: { type: number, minimum: 0 }
+        latency_ms: { type: number, minimum: 0, maximum: 86400000 }
         ip: { type: string }
-        payload_bytes: { type: integer, minimum: 0 }
+        payload_bytes: { type: integer, minimum: 0, maximum: 1099511627776 }
     IngestRequest:
       type: object
       required: [logs]

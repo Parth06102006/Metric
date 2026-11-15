@@ -29,12 +29,28 @@ func TestActiveProjectsPreservesLiveRecordsWithoutDuplicates(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := New(time.Hour)
-			if err := r.Append(ctx, "project", []domain.LogRecord{expiredA, liveA, expiredB, liveB}); err != nil {
+			// Insert while fresh, then advance the recorded timestamps to model
+			// expiration without waiting for wall-clock time.
+			freshA, freshB := expiredA, expiredB
+			freshA.Ts, freshB.Ts = now, now
+			if err := r.Append(ctx, "project", []domain.LogRecord{freshA, liveA, freshB, liveB}); err != nil {
 				t.Fatal(err)
 			}
-			if err := r.Append(ctx, "expired", []domain.LogRecord{expiredA}); err != nil {
+			p := r.lookup("project", false)
+			p.mu.Lock()
+			p.records[0].Ts = expiredA.Ts
+			p.records[2].Ts = expiredB.Ts
+			p.earliest = expiredB.Ts
+			p.mu.Unlock()
+			if err := r.Append(ctx, "expired", []domain.LogRecord{freshA}); err != nil {
 				t.Fatal(err)
 			}
+			p = r.lookup("expired", false)
+			p.mu.Lock()
+			p.records[0].Ts = expiredA.Ts
+			p.earliest = expiredA.Ts
+			p.latest.Store(expiredA.Ts.UnixNano())
+			p.mu.Unlock()
 			for i := 0; i < tc.calls; i++ {
 				if got := r.ActiveProjects(ctx); !reflect.DeepEqual(got, []string{"project"}) {
 					t.Fatalf("ActiveProjects call %d = %v, want [project]", i+1, got)

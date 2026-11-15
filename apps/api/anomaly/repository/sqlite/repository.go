@@ -43,7 +43,7 @@ func (r *Repository) SaveWithAnalysis(ctx context.Context, projectID string, a *
 	}
 	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
 	var pending int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_jobs WHERE status IN ('pending','processing')`).Scan(&pending); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM analysis_jobs WHERE status IN ('pending','processing','dispatching')`).Scan(&pending); err != nil {
 		return err
 	}
 	status := "pending"

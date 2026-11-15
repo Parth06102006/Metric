@@ -21,11 +21,15 @@ func NewUsecase(thresholds domain.ThresholdRepository, projects domain.ProjectRe
 // Get returns the stored thresholds, falling back to defaults when the project
 // has never had them written.
 func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Threshold, error) {
+	identity, err := domain.RequireIdentity(ctx)
+	if err != nil {
+		return domain.Threshold{}, err
+	}
 	p, err := u.projects.Get(ctx, projectID)
 	if err != nil {
 		return domain.Threshold{}, err
 	}
-	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
+	if !p.CanAccess(identity) {
 		return domain.Threshold{}, domain.ErrAccessDenied
 	}
 
@@ -41,12 +45,11 @@ func (u *Usecase) Get(ctx context.Context, projectID string) (domain.Threshold, 
 
 // Update validates and upserts thresholds.
 func (u *Usecase) Update(ctx context.Context, projectID string, thresholds domain.Threshold) error {
-	p, err := u.projects.Get(ctx, projectID)
-	if err != nil {
+	if _, err := domain.RequireAdmin(ctx); err != nil {
 		return err
 	}
-	if identity, ok := domain.IdentityFrom(ctx); ok && !p.CanAccess(identity) {
-		return domain.ErrAccessDenied
+	if _, err := u.projects.Get(ctx, projectID); err != nil {
+		return err
 	}
 	if err := thresholds.Validate(); err != nil {
 		return err

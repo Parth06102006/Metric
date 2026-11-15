@@ -28,10 +28,22 @@ func (r *Repository) ClaimAnalysis(ctx context.Context, now time.Time, lease tim
 		return AnalysisJob{}, err
 	}
 	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
+	// A provider may have billed an interrupted request. Never redispatch it.
+	if _, err = tx.ExecContext(ctx, `UPDATE anomalies SET analysis_status='failed', analysis=message || ' Advisory analysis outcome unknown after interruption.' WHERE id IN (SELECT anomaly_id FROM analysis_jobs WHERE status='dispatching' AND lease_until<=?)`, now.UnixMilli()); err != nil {
+		return AnalysisJob{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE status='dispatching' AND lease_until<=?`, now.UnixMilli()); err != nil {
+		return AnalysisJob{}, err
+	}
 	var job AnalysisJob
 	var created int64
 	err = tx.QueryRowContext(ctx, `SELECT anomaly_id,project_id,state_json,attempts,created_at FROM analysis_jobs WHERE (status='pending' AND next_attempt<=?) OR (status='processing' AND lease_until<=?) ORDER BY created_at,anomaly_id LIMIT 1`, now.UnixMilli(), now.UnixMilli()).Scan(&job.AnomalyID, &job.ProjectID, &job.StateJSON, &job.Attempts, &created)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			if commitErr := tx.Commit(); commitErr != nil {
+				return AnalysisJob{}, commitErr
+			}
+		}
 		return AnalysisJob{}, err
 	}
 	job.CreatedAt = time.UnixMilli(created).UTC()
@@ -51,6 +63,55 @@ func (r *Repository) ClaimAnalysis(ctx context.Context, now time.Time, lease tim
 	return job, nil
 }
 
+// BeginAnalysisCall atomically reserves a daily provider call before dispatch.
+// If the budget is exhausted the job is marked skipped and removed.
+func (r *Repository) BeginAnalysisCall(ctx context.Context, job AnalysisJob, now time.Time, dailyLimit int) (bool, error) {
+	if dailyLimit <= 0 {
+		return false, fmt.Errorf("invalid daily call limit")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE analysis_jobs SET status='dispatching' WHERE anomaly_id=? AND lease_token=? AND status='processing' AND lease_until>?`, job.AnomalyID, job.LeaseToken, now.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n != 1 {
+		return false, fmt.Errorf("analysis lease expired or job deleted")
+	}
+	day := now.UTC().Format("2006-01-02")
+	var calls int
+	err = tx.QueryRowContext(ctx, `SELECT reserved FROM analysis_daily_calls WHERE utc_day=?`, day).Scan(&calls)
+	if err != nil && err != sql.ErrNoRows {
+		return false, err
+	}
+	if calls >= dailyLimit {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE anomaly_id=? AND lease_token=?`, job.AnomalyID, job.LeaseToken); err != nil {
+			return false, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE anomalies SET analysis_status='skipped',analysis=message || ' Advisory analysis skipped: daily call limit reached.' WHERE id=? AND project_id=?`, job.AnomalyID, job.ProjectID); err != nil {
+			return false, err
+		}
+		if err = tx.Commit(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO analysis_daily_calls(utc_day,reserved) VALUES(?,1) ON CONFLICT(utc_day) DO UPDATE SET reserved=reserved+1`, day); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (r *Repository) CompleteAnalysis(ctx context.Context, job AnalysisJob, diagnosis domain.Diagnosis, narrative string) error {
 	payload, err := json.Marshal(diagnosis)
 	if err != nil {
@@ -61,7 +122,7 @@ func (r *Repository) CompleteAnalysis(ctx context.Context, job AnalysisJob, diag
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
-	res, err := tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE anomaly_id=? AND lease_token=? AND status='processing'`, job.AnomalyID, job.LeaseToken)
+	res, err := tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE anomaly_id=? AND lease_token=? AND status IN ('processing','dispatching')`, job.AnomalyID, job.LeaseToken)
 	if err != nil {
 		return err
 	}
@@ -94,7 +155,7 @@ func (r *Repository) FailAnalysis(ctx context.Context, job AnalysisJob, retryAt 
 	defer func() { _ = tx.Rollback() }() // Commit makes this a no-op.
 	var res sql.Result
 	if permanent {
-		res, err = tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE anomaly_id=? AND lease_token=? AND status='processing'`, job.AnomalyID, job.LeaseToken)
+		res, err = tx.ExecContext(ctx, `DELETE FROM analysis_jobs WHERE anomaly_id=? AND lease_token=? AND status IN ('processing','dispatching')`, job.AnomalyID, job.LeaseToken)
 	} else {
 		res, err = tx.ExecContext(ctx, `UPDATE analysis_jobs SET status='pending',next_attempt=?,lease_until=0,lease_token='' WHERE anomaly_id=? AND lease_token=? AND status='processing'`, retryAt.UnixMilli(), job.AnomalyID, job.LeaseToken)
 	}

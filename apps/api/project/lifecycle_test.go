@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"traffic-center/domain"
+	"traffic-center/internal/projectgate"
 	"traffic-center/metrics/repository/memory"
 	"traffic-center/project"
 	rowmemory "traffic-center/project/repository/memory"
@@ -29,9 +30,9 @@ func (b *recordingBroadcaster) Drop(projectID string) {
 func TestLifecycleRotateKey(t *testing.T) {
 	repo := rowmemory.New()
 	usecase := project.NewUsecase(repo)
-	lifecycle := project.NewLifecycle(repo, memory.New(time.Minute), nil)
+	lifecycle := project.NewLifecycle(repo, memory.New(time.Minute), nil, projectgate.New())
 
-	created, err := usecase.Create(context.Background(), "Rotate Target")
+	created, err := usecase.Create(adminContext(), "Rotate Target")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestLifecycleRotateKey(t *testing.T) {
 		t.Fatalf("original key authenticate = %v, %v", ok, err)
 	}
 
-	rotated, err := lifecycle.RotateKey(context.Background(), created.ID)
+	rotated, err := lifecycle.RotateKey(adminContext(), created.ID)
 	if err != nil {
 		t.Fatalf("RotateKey: %v", err)
 	}
@@ -61,10 +62,10 @@ func TestLifecycleRotateKey(t *testing.T) {
 		t.Fatalf("new key authenticate after rotation = %v, %v", ok, err)
 	}
 
-	if _, err := lifecycle.RotateKey(context.Background(), "missing"); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := lifecycle.RotateKey(adminContext(), "missing"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("RotateKey missing = %v, want ErrNotFound", err)
 	}
-	if _, err := lifecycle.RotateKey(context.Background(), ""); !errors.Is(err, domain.ErrValidation) {
+	if _, err := lifecycle.RotateKey(adminContext(), ""); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("RotateKey empty id = %v, want validation", err)
 	}
 }
@@ -72,14 +73,14 @@ func TestLifecycleRotateKey(t *testing.T) {
 func TestLifecycleRevokeKey(t *testing.T) {
 	repo := rowmemory.New()
 	usecase := project.NewUsecase(repo)
-	lifecycle := project.NewLifecycle(repo, nil, nil)
+	lifecycle := project.NewLifecycle(repo, nil, nil, projectgate.New())
 
-	created, err := usecase.Create(context.Background(), "Revoke Target")
+	created, err := usecase.Create(adminContext(), "Revoke Target")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := lifecycle.RevokeKey(context.Background(), created.ID); err != nil {
+	if err := lifecycle.RevokeKey(adminContext(), created.ID); err != nil {
 		t.Fatalf("RevokeKey: %v", err)
 	}
 
@@ -89,11 +90,11 @@ func TestLifecycleRevokeKey(t *testing.T) {
 	}
 
 	// Revocation is idempotent for an existing project.
-	if err := lifecycle.RevokeKey(context.Background(), created.ID); err != nil {
+	if err := lifecycle.RevokeKey(adminContext(), created.ID); err != nil {
 		t.Fatalf("second RevokeKey = %v, want nil", err)
 	}
 
-	if err := lifecycle.RevokeKey(context.Background(), "missing"); !errors.Is(err, domain.ErrNotFound) {
+	if err := lifecycle.RevokeKey(adminContext(), "missing"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("RevokeKey missing = %v, want ErrNotFound", err)
 	}
 }
@@ -103,9 +104,9 @@ func TestLifecycleDeleteProject(t *testing.T) {
 	usecase := project.NewUsecase(repo)
 	records := memory.New(time.Minute)
 	broadcaster := &recordingBroadcaster{}
-	lifecycle := project.NewLifecycle(repo, records, broadcaster)
+	lifecycle := project.NewLifecycle(repo, records, broadcaster, projectgate.New())
 
-	ctx := context.Background()
+	ctx := adminContext()
 	created, err := usecase.Create(ctx, "Doomed")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -145,8 +146,8 @@ func TestLifecycleAssignOwner(t *testing.T) {
 	repo := rowmemory.New()
 	usecase := project.NewUsecase(repo)
 	broadcaster := &recordingBroadcaster{}
-	lifecycle := project.NewLifecycle(repo, nil, broadcaster)
-	ctx := context.Background()
+	lifecycle := project.NewLifecycle(repo, nil, broadcaster, projectgate.New())
+	ctx := adminContext()
 
 	created, err := usecase.Create(ctx, "Handover")
 	if err != nil {

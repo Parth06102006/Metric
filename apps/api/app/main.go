@@ -20,11 +20,13 @@ import (
 	"traffic-center/ingest"
 	"traffic-center/internal/analysis"
 	"traffic-center/internal/config"
-	"traffic-center/internal/jev"
+	"traffic-center/internal/gemini"
+	"traffic-center/internal/projectgate"
 	"traffic-center/internal/server"
 	"traffic-center/internal/sqlite"
 	"traffic-center/internal/ws"
 	"traffic-center/metrics"
+	metricsdurable "traffic-center/metrics/repository/durable"
 	metricsmemory "traffic-center/metrics/repository/memory"
 	metricssqlite "traffic-center/metrics/repository/sqlite"
 	"traffic-center/project"
@@ -60,7 +62,9 @@ func run() error {
 		logger.Warn("ADMIN_EMAILS is empty in production; admin actions will be denied")
 	}
 
-	db, err := sqlite.Open(cfg.DatabasePath)
+	// The live journal contains IPs and paths. New SQLite files are private.
+	syscall.Umask(0077)
+	db, err := sqlite.OpenWithLimit(cfg.DatabasePath, cfg.SQLiteMaxBytes)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -73,22 +77,47 @@ func run() error {
 	// Repositories (adapters).
 	projectRepo := projectsqlite.New(db)
 	thresholdRepo := thresholdsqlite.New(db)
-	recordRepo := metricsmemory.New(cfg.MetricsWindow)
+	liveMemory := metricsmemory.NewWithLimits(cfg.MetricsWindow, metricsmemory.Limits{
+		ProjectRecords: cfg.MaxProjectRecords, ProjectEndpoints: cfg.MaxProjectEndpoints, TotalRecords: cfg.MaxTotalRecords, Projects: cfg.MaxLiveProjects,
+		ProjectBytes: cfg.MaxProjectBytes, TotalBytes: cfg.MaxTotalBytes,
+	})
+	recordRepo, err := metricsdurable.New(db, liveMemory, cfg.MetricsWindow, uint64(cfg.MinFreeDiskBytes))
+	if err != nil {
+		return fmt.Errorf("initialize live journal: %w", err)
+	}
+	var seq int
+	var name, databaseFile string
+	if err := db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &databaseFile); err != nil {
+		return err
+	}
+	for _, path := range []string{databaseFile, databaseFile + "-wal", databaseFile + "-shm"} {
+		if err := os.Chmod(path, 0600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("protect SQLite files: %w", err)
+		}
+	}
+	if err := recordRepo.Recover(context.Background()); err != nil {
+		return fmt.Errorf("recover live records: %w", err)
+	}
+	pruneCtx, stopPruner := context.WithCancel(context.Background())
+	prunerDone := make(chan struct{})
+	go func() { defer close(prunerDone); recordRepo.RunPruner(pruneCtx, logger) }()
+	defer func() { stopPruner(); <-prunerDone }()
 	snapshotRepo := metricssqlite.New(db)
 	anomalyRepo := anomalysqlite.New(db)
 	auditRepo := auditsqlite.New(db)
 	hub := ws.NewHub()
+	gate := projectgate.New()
 
 	// Usecases.
 	projectUsecase := project.NewUsecase(projectRepo)
-	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub)
+	projectLifecycle := project.NewLifecycle(projectRepo, recordRepo, hub, gate)
 	thresholdUsecase := threshold.NewUsecase(thresholdRepo, projectRepo)
 	metricsUsecase := metrics.NewUsecase(recordRepo, snapshotRepo, cfg.MetricsWindow)
-	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo)
+	ingestUsecase := ingest.NewUsecase(projectRepo, recordRepo, gate, cfg.MetricsWindow)
 
 	anomalyUsecase := anomaly.NewUsecase(anomalyRepo, thresholdRepo, nil, hub, cfg.DedupeWindow)
-	if cfg.JevAPIKey != "" {
-		analyst := analysis.NewWorker(anomalyRepo, jev.New(cfg.JevAPIKey, cfg.JevModel), snapshotRepo)
+	if cfg.GeminiAPIKey != "" {
+		analyst := analysis.NewWorker(anomalyRepo, gemini.New(cfg.GeminiAPIKey, cfg.GeminiModel), snapshotRepo, cfg.GeminiMaxDailyCalls)
 		analyst.SetBroadcaster(hub)
 		analyst.Start()
 		defer analyst.Stop()
@@ -105,6 +134,8 @@ func run() error {
 		cfg.WorkerInterval,
 		cfg.SnapshotRetention,
 		logger,
+		projectRepo,
+		gate,
 	)
 	worker.Start()
 	defer worker.Stop()
@@ -126,6 +157,7 @@ func run() error {
 		ProjectRepo: projectRepo,
 		RecordRepo:  recordRepo,
 		Hub:         hub,
+		Readiness:   recordRepo,
 	})
 
 	httpServer := &http.Server{

@@ -27,8 +27,8 @@ identity with headers.
 
 - Multi-region or horizontal scaling. The in-memory request window and SQLite
   make this a single-writer system.
-- Long-term raw request storage. Only computed snapshots and anomalies are
-  persisted.
+- Long-term raw request storage. Raw records are journaled for restart recovery
+  and pruned after expiry, though SQLite and backups may retain deleted bytes.
 - A general-purpose alerting system. Rules are fixed and threshold-based.
 
 ## 2. Topology
@@ -90,9 +90,20 @@ the host.
 3. The ingest usecase checks `X-API-Key` against the stored SHA-256 hash using
    `subtle.ConstantTimeCompare`. A missing project and a wrong key both return
    401, so project IDs cannot be enumerated.
-4. Records are validated (timestamp, endpoint, method, status, latency, payload,
-   parseable IP), then appended to the project's in-memory rolling window.
-5. Response: `202 {"accepted": n}`.
+4. Timestamps must be within the live window and no more than five seconds
+   ahead; small future skew is clamped. Field lengths, numeric values, per-project
+   endpoint cardinality, retained record counts and estimated bytes are bounded.
+   Concurrent ingestion and body size are also capped. A capacity failure returns
+   HTTP 429 with Retry-After without a partial batch; clients should back off.
+5. The memory window reserves capacity, then a FULL-synchronous SQLite WAL
+   transaction journals the batch before it is published or a 202 is returned.
+   Live records are reloaded on restart; old batches are pruned incrementally.
+   Low disk and journal failures return 503. Uncertain responses can yield
+   duplicates on retry. The journal includes IPs and paths; deleted bytes can
+   persist in free pages, WAL and backups.
+6. SQLite main-file pages have a configurable cap, while a free-space check
+   rejects ingestion before its reserve is consumed. Neither limits WAL, other
+   processes or all filesystem usage; memory limits do not cap total RSS.
 
 ### Live stream — `/ws/{projectID}`
 
@@ -116,7 +127,20 @@ clients.
 
 ### Background pipeline
 
-The anomaly worker ticks every `WORKER_INTERVAL` (5s default):
+The anomaly worker ticks every `WORKER_INTERVAL` (5s default). A bounded pool of
+four workers evaluates different projects concurrently; cycles do not overlap.
+Each evaluation acquires the shared per-project operation gate and rechecks
+project existence. Ingestion holds that gate from authentication through append;
+deletion holds it through database deletion, stream disconnection and live-window
+cleanup. Key rotation and revocation also take the same gate. Lock order is operation gate → stream-access fence → repositories.
+Thus deletion waits for earlier work, and queued ingestion/evaluation checks the
+deleted project afresh. Idle gate entries are released rather than retained.
+This coordination is process-local, not a multi-replica protocol.
+
+Cycle duration and active-project count are logged at debug level; cycles that
+exceed `WORKER_INTERVAL` produce a warning. Snapshot persistence failure stops
+that project's publication/evaluation for the cycle.
+
 
 ```text
 ActiveProjects()
@@ -135,13 +159,15 @@ metrics.Usecase.Current()  ──▶ domain.Compute(records, window)
                  └── Hub.BroadcastAnomaly()
                             │
                             ▼
-                background worker → Jev → save advisory result → broadcast update
+                background worker → Gemini Decisions → save advisory result → broadcast update
 ```
 
 Snapshots older than `SNAPSHOT_RETENTION` are pruned at most once an hour.
 `ActiveProjects` also drops projects whose live window is empty, so idle
 projects stop generating rows. A separate hourly job prunes audit events older
-than `AUDIT_RETENTION`.
+than `AUDIT_RETENTION`. Analysis dispatch is durably reserved against a UTC-day
+call cap; an interrupted or failed provider call is not retried, to avoid a
+second potentially billed call. This sacrifices some advisory results.
 
 ## 4. Backend structure
 
@@ -180,7 +206,7 @@ apps/api/
                                identity, admin, timeout
     rest/                      HTTP handlers per feature
     ws/                        hub + websocket handler
-    jev/                       Jev structured incident analysis via OpenRouter
+    gemini/                    Gemini Decisions API incident-analysis adapter
     analysis/                  durable background job worker
     sqlite/                    connection, pragmas, schema migration
     server/                    chi route map and middleware wiring
@@ -253,8 +279,9 @@ RequestID → StripSlashes → RealIP → Logger → Recoverer → route
 
 ## 5. Data model
 
-SQLite runs with WAL, `busy_timeout=5000`, foreign keys, and
-`SetMaxOpenConns(1)` to serialize writers.
+SQLite runs with WAL, `busy_timeout=5000`, per-connection foreign keys, and a
+10-connection pool. Immediate write transactions reserve SQLite's single writer
+before reads; additional connections do not create parallel SQLite writers.
 
 ```sql
 projects (
@@ -276,7 +303,7 @@ thresholds (
 
 metric_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   ts INTEGER NOT NULL,              -- unix milliseconds
   window_s INTEGER NOT NULL,
   rps REAL, p50 REAL, p95 REAL, p99 REAL,
@@ -288,7 +315,7 @@ metric_snapshots (
 
 anomalies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   severity TEXT NOT NULL,
   message TEXT NOT NULL,
@@ -313,9 +340,8 @@ audit_events (
 -- indexes: (ts DESC), (action, ts DESC)
 ```
 
-`endpoints_json` is the only embedded document left: it is a variable-size map
-with no query requirements. Everything used for filtering or ordering is a real
-column.
+`endpoints_json`, analysis evidence and live journal batches are embedded
+JSON; indexed columns provide project and time filtering.
 
 ### Migration
 
@@ -333,18 +359,42 @@ column.
 5. Create the snapshot, anomaly, and audit tables with their indexes.
 6. Drop the unused `alerts` table.
 7. Add diagnosis fields and durable analysis jobs.
-8. Add the authenticated user directory and view-only project memberships; set
-   `PRAGMA user_version = 7`.
+8. Add the authenticated user directory and view-only project memberships.
+9. Transactionally rebuild snapshots, anomalies and analysis jobs with project
+   foreign keys and cascading deletion. Preserve valid row IDs, diagnosis fields,
+   pending/processing jobs, leases and AUTOINCREMENT high-water marks; discard
+   rows whose parent project/incident no longer exists. Verify foreign keys.
+10. Schema v9 adds the live journal and daily analysis-call counter. On upgrade,
+    pre-v9 processing jobs are failed closed because a call may already have
+    been billed; pending jobs remain. Set `PRAGMA user_version = 9`.
+
+Back up the database before deploying this migration. The rebuild requires disk
+space for copied tables/indexes and WAL, and startup time proportional to retained
+data. Audit events intentionally outlive projects and are not cascaded.
 
 Legacy tables are retained for inspection but are not read by the application.
 
 ### Live records
 
-Raw `LogRecord`s live in `metrics/repository/memory`, keyed by project. Each
-`Append` and `Recent` prunes entries older than the rolling window. This bounds
-memory by (active projects × request rate × window), not by uptime. A restart
-loses the current window and the next snapshot starts fresh; history remains in
-SQLite.
+Raw `LogRecord`s are journaled in SQLite and cached in
+`metrics/repository/memory`, keyed by project. A short
+map lock protects lookup; each project has its own record lock. Appends track the
+earliest timestamp and skip full-window pruning until an event can expire;
+append-only sweeps run at most once per second (or once per window if shorter).
+Reads still prune at the exact cutoff. Out-of-order records remain supported.
+Already expired input is not retained. Pruning
+clears expired backing-array references. Active discovery reads each window's
+latest timestamp atomically, rather than scanning every record or waiting for a
+busy project's lock; empty idle entries are reclaimed opportunistically.
+
+`Recent` returns a copy and exact percentile calculation still sorts raw latency
+values. REST and initial WebSocket snapshots remain freshly computed: there is
+no stale-cache or approximate-percentile change. The IP-count map grows with
+actual cardinality instead of preallocating by request count. Memory still scales
+with active traffic and window size, bounded by admission limits that are not
+an RSS guarantee. Restart reconstructs unexpired committed batches; startup
+fails closed if current memory limits cannot accommodate them. See
+`docs/performance-hardening.md` for earlier benchmark scope and results.
 
 ## 6. Auth and trust
 
@@ -400,14 +450,23 @@ The hub groups subscribers by project. Each client has:
 - `done chan struct{}` — closed exactly once via `sync.Once`.
 
 Broadcast copies the subscriber slice under `RLock`, then performs a
-non-blocking send per client (`send`, `done`, `default`). A slow client drops
-events instead of stalling the worker. Unregister closes `done`, removes the
-client, and the writer goroutine exits. Because `send` is never closed, the
-classic "send on closed channel" panic is structurally impossible.
+non-blocking send per client (`send`, `done`, `default`). A full queue causes
+that subscriber to be unregistered and disconnected, rather than silently
+losing an event on a still-open stream. Healthy subscribers continue normally.
+Reconnect obtains a fresh snapshot and the SPA refetches metric/incident history;
+WebSockets remain best-effort notifications, not a durable event log. Unregister
+closes `done`, removes the client, and the writer goroutine exits. Because `send`
+is never closed, the classic "send on closed channel" panic is structurally impossible.
 
 The handler runs one reader goroutine (disconnect detection and pong deadlines)
-and one writer loop (messages and pings). The HTTP server has no `WriteTimeout`
-so long-lived websockets are not cut off.
+and one writer loop (messages and pings). The HTTP server has no `WriteTimeout`;
+the handler instead enforces a fixed five-minute authentication lifetime from
+request entry. An independent expiry timer sends close code `1001`
+("authentication refresh required") and closes the socket, even if the writer
+is waiting on a snapshot or access fence. All data-write deadlines are capped
+at expiry, and initial snapshot loading receives the expiring request context.
+The close control frame alone gets up to five seconds of I/O grace. Pongs only
+extend the separate idle read deadline, never the authentication lifetime.
 
 ## 8. SPA
 
@@ -452,10 +511,15 @@ React never maps over samples for rendering.
 
 ### Reconnect and session expiry
 
-`LiveConnection` reconnects with exponential backoff (1s → 30s). After three
-consecutive failures it probes `/api/auth/me`; a 401 redirects to
+`LiveConnection` reconnects with exponential backoff (1s → 30s), including when
+the API closes a connection at its five-minute authentication limit. Every
+reconnect passes through Caddy `forward_auth` and project authorization again.
+After three consecutive failures it probes `/api/auth/me`; a 401 redirects to
 `/oauth2/start?rd=…` instead of retrying forever. The initial websocket message
-is a full snapshot, so a reconnect immediately repopulates the chart.
+is a full snapshot, so a reconnect immediately repopulates the chart. This bounds
+streaming after the proxy would reject a new handshake, not identity-provider
+revocation latency: oauth2-proxy has a separate one-hour `cookie_refresh` policy
+and provider-specific revocation behavior.
 
 ## 9. Deployment
 
@@ -482,10 +546,11 @@ docker compose
 
 - **Single writer.** SQLite plus a process-local hub means one API instance.
   Scaling out requires a shared store and a pub/sub bus.
-- **Asynchronous advisory analysis.** With an OpenRouter key, a bounded SQLite
-  queue and one background goroutine enrich persisted alerts using Jev. Jobs are leased,
-  retried at most three times and can be replayed after a crash; a provider
-  call may be billed again if a crash happens before the result is committed.
+- **Asynchronous advisory analysis.** With a Gemini API key, a bounded SQLite
+  queue and one background goroutine enrich persisted alerts using Gemini Decisions. Before dispatch,
+  the worker persists a daily call reservation and marks the job dispatched.
+  A call with an uncertain outcome is failed instead of retried; jobs interrupted
+  before dispatch remain recoverable.
   Queue-full and failed cases preserve the rule-based alert. Without a key,
   no jobs are created or processed; existing pending jobs resume when the key
   is restored. The provider receives aggregate metrics and anonymized endpoint
@@ -494,12 +559,17 @@ docker compose
   using medians; their time span does not guarantee continuous coverage.
   Suggestions require a baseline, at least 20 requests and a model evidence
   probability of 0.7; these initial gates are heuristics, not measured accuracy.
-  The 30-second attempt limit is per process and is not a spending cap.
-- **Memory window is per process.** A restart loses up to one window of raw
-  requests, so the first snapshot after restart may be sparse.
+  The 30-second attempt interval is per process. The daily reservation limit
+  bounds application calls, not total provider costs or other clients.
+- **Live journal is short-lived.** Recovery preserves only still-unexpired
+  records; it is not long-term event storage or exactly-once ingestion.
 - **Dedupe is per anomaly type.** A project can have at most one alert of each
   type per `DEDUPE_WINDOW`, regardless of severity changes.
-- **Graph history is bounded to the newest 900 snapshots.** The SPA restores
+- **Graph history is bounded to the newest 900 snapshots and 4 MiB of endpoint
+  JSON.** When that byte budget is reached, fewer newest snapshots are returned.
+  A single oversized newest snapshot returns 429 rather than exhausting memory.
+  Range reads fail closed on the same endpoint-data budget; analysis then
+  withholds baseline-based suggestions. The SPA restores
   this series from `GET /api/projects/{id}/metrics/history` on load and after
   reconnect, then merges it with the live stream. `SnapshotRepository.Range`
   remains the time-range query used by analysis.
