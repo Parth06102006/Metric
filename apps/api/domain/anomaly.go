@@ -13,14 +13,16 @@ const (
 
 // Anomaly is a detected traffic abnormality.
 type Anomaly struct {
-	ID         int64     `json:"id,omitempty"`
-	Type       string    `json:"type"`
-	Severity   string    `json:"severity"`
-	Message    string    `json:"message"`
-	Value      float64   `json:"value"`
-	Threshold  float64   `json:"threshold"`
-	Analysis   string    `json:"analysis,omitempty"`
-	DetectedAt time.Time `json:"detected_at"`
+	ID             int64      `json:"id,omitempty"`
+	Type           string     `json:"type"`
+	Severity       string     `json:"severity"`
+	Message        string     `json:"message"`
+	Value          float64    `json:"value"`
+	Threshold      float64    `json:"threshold"`
+	Analysis       string     `json:"analysis,omitempty"`
+	AnalysisStatus string     `json:"analysis_status,omitempty"`
+	Diagnosis      *Diagnosis `json:"diagnosis,omitempty"`
+	DetectedAt     time.Time  `json:"detected_at"`
 }
 
 // Detect checks a snapshot against configured thresholds.

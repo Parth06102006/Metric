@@ -1,17 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowUpRight, Copy } from "lucide-react";
+import { ArrowUpRight, Copy, FolderKanban, Search } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import { Button, Card, ErrorNote, Input, Spinner } from "../components/ui";
+import { Button, Card, ErrorNote, Input, LoadingRows } from "../components/ui";
+import { useMe } from "../features/identity/api";
 import { createProject, listProjects } from "../features/projects/api";
+import { copyToClipboard } from "../lib/clipboard";
 import type { CreatedProject } from "../types/api";
 
 export function Dashboard() {
   const queryClient = useQueryClient();
   const projects = useQuery({ queryKey: ["projects"], queryFn: listProjects });
+  const me = useMe();
+  const isAdmin = me.data?.admin === true;
 
   const [name, setName] = useState("");
+  const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedProject | null>(null);
   const [copied, setCopied] = useState(false);
@@ -27,28 +32,29 @@ export function Dashboard() {
     },
   });
 
+  const searchTerm = search.trim().toLocaleLowerCase();
+  const visibleProjects = projects.data?.filter((project) =>
+    [project.name, project.project_id, ...(isAdmin && project.owner_email ? [project.owner_email] : [])]
+      .some((value) => value.toLocaleLowerCase().includes(searchTerm)),
+  );
+
   const copyKey = async () => {
     if (!created) return;
-    try {
-      await navigator.clipboard.writeText(created.api_key);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(false);
-    }
+    const ok = await copyToClipboard(created.api_key);
+    setCopied(ok);
+    if (ok) window.setTimeout(() => setCopied(false), 2000);
   };
 
   return (
-    <div className="space-y-8">
-      <section className="flex flex-wrap items-end justify-between gap-4">
+    <div className="space-y-7 sm:space-y-9">
+      <section className="flex flex-wrap items-end justify-between gap-5 border-b border-line/70 pb-6 sm:pb-8">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
-          <p className="mt-1 text-sm text-muted">
-            Live traffic for your projects.
-          </p>
+          <p className="mb-2 text-[11px] font-semibold uppercase tracking-[.18em] text-accent/80">Workspace overview</p>
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-[2.6rem]">Projects</h1>
+          <p className="mt-2 text-sm text-muted">Monitor traffic and manage your connected services.</p>
         </div>
 
-        {creating ? (
+        {isAdmin && (creating ? (
           <form
             className="flex w-full items-end gap-2 sm:w-auto"
             onSubmit={(event) => {
@@ -85,7 +91,7 @@ export function Dashboard() {
           </form>
         ) : (
           <Button onClick={() => setCreating(true)}>New project</Button>
-        )}
+        ))}
       </section>
 
       {create.isError && (
@@ -118,7 +124,7 @@ export function Dashboard() {
         </Card>
       )}
 
-      {projects.isLoading && <Spinner label="Loading projects" />}
+      {projects.isLoading && <LoadingRows label="Loading projects" rows={4} />}
 
       {projects.isError && (
         <ErrorNote
@@ -127,33 +133,49 @@ export function Dashboard() {
       )}
 
       {projects.data?.length === 0 && (
-        <Card className="border-dashed p-8 text-center">
-          <p className="text-sm font-medium">No projects yet</p>
+        <Card className="border-dashed p-10 text-center sm:p-14">
+          <span className="mx-auto grid size-12 place-items-center rounded-2xl border border-line bg-raised text-accent"><FolderKanban className="size-5" aria-hidden /></span>
+          <p className="mt-4 text-sm font-medium">
+            {me.data && !isAdmin ? "No projects assigned to you" : "No projects yet"}
+          </p>
           <p className="mx-auto mt-1 max-w-md text-sm text-muted">
-            Create a project to get an ingest URL and API key.
+            {me.data && !isAdmin
+              ? "Ask an administrator to assign a project to your account."
+              : "Create a project to get an ingest URL and API key."}
           </p>
         </Card>
       )}
 
       {projects.data && projects.data.length > 0 && (
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {projects.data.map((project) => (
+        <section aria-label="Project list" className="overflow-hidden rounded-xl border border-line/90 bg-surface/65">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line/80 px-4 py-3 sm:px-5">
+            <p className="text-xs text-muted" aria-live="polite">{visibleProjects?.length} of {projects.data.length} {projects.data.length === 1 ? "project" : "projects"}</p>
+            <div className="relative w-full sm:w-64"><Search aria-hidden className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" /><label htmlFor="project-search" className="sr-only">Search projects</label><Input id="project-search" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search projects" className="pl-9" /></div>
+          </div>
+          {visibleProjects?.length === 0 && <p className="p-6 text-sm text-muted">No projects match your search.</p>}
+          <div className="divide-y divide-line/70">
+          {visibleProjects?.map((project) => (
             <Link
               key={project.project_id}
               to={`/p/${project.project_id}`}
-              className="group rounded-lg border border-line bg-surface p-4 transition-colors hover:border-accent/50 hover:bg-raised"
+            className="group grid min-h-[76px] grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 transition-colors duration-200 hover:bg-raised/70 sm:grid-cols-[minmax(0,1fr)_minmax(130px,.55fr)_auto] sm:px-5"
             >
-              <div className="flex items-start justify-between gap-3">
-                <h2 className="text-sm font-medium">{project.name}</h2>
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="grid size-9 shrink-0 place-items-center rounded-lg border border-line bg-canvas text-accent"><FolderKanban className="size-4" aria-hidden /></span>
+                <div className="min-w-0"><h2 className="truncate text-sm font-medium tracking-tight">{project.name}</h2>
+                  <p className="mt-1 truncate font-mono text-[11px] text-muted">{project.project_id}</p></div>
+              </div>
+              <div className="hidden min-w-0 sm:block">
+                {isAdmin && project.owner_email ? <p className="truncate text-xs text-muted" title={project.owner_email}>{project.owner_email}</p> : <p className="text-xs text-muted">Open overview</p>}
+              </div>
                 <ArrowUpRight
-                  className="size-4 shrink-0 text-muted transition-colors group-hover:text-accent"
+                  className="size-4 shrink-0 text-muted transition-transform group-hover:translate-x-0.5 group-hover:-translate-y-0.5 group-hover:text-accent"
                   aria-hidden
                 />
-              </div>
-              <p className="mt-3 truncate font-mono text-[11px] text-muted">{project.project_id}</p>
             </Link>
           ))}
-        </div>
+          </div>
+        </section>
       )}
     </div>
   );

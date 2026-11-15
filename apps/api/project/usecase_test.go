@@ -11,11 +11,15 @@ import (
 	"traffic-center/project/repository/memory"
 )
 
+func adminContext() context.Context {
+	return domain.WithIdentity(context.Background(), domain.Identity{Email: "admin@example.com", Admin: true})
+}
+
 func TestCreateAndAuthenticate(t *testing.T) {
 	repo := memory.New()
 	usecase := project.NewUsecase(repo)
 
-	created, err := usecase.Create(context.Background(), "  Checkout API  ")
+	created, err := usecase.Create(adminContext(), "  Checkout API  ")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -36,7 +40,7 @@ func TestCreateAndAuthenticate(t *testing.T) {
 		t.Fatalf("Authenticate with wrong key = %v, %v", ok, err)
 	}
 
-	got, err := usecase.Get(context.Background(), created.ID)
+	got, err := usecase.Get(adminContext(), created.ID)
 	if err != nil || got.Name != created.Name {
 		t.Fatalf("Get = %+v, %v", got, err)
 	}
@@ -45,18 +49,18 @@ func TestCreateAndAuthenticate(t *testing.T) {
 func TestCreateValidation(t *testing.T) {
 	usecase := project.NewUsecase(memory.New())
 
-	if _, err := usecase.Create(context.Background(), "   "); !errors.Is(err, domain.ErrValidation) {
+	if _, err := usecase.Create(adminContext(), "   "); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("empty name error = %v, want validation", err)
 	}
 
-	if _, err := usecase.Create(context.Background(), strings.Repeat("x", 101)); !errors.Is(err, domain.ErrValidation) {
+	if _, err := usecase.Create(adminContext(), strings.Repeat("x", 101)); !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("long name error = %v, want validation", err)
 	}
 }
 
 func TestGetMissing(t *testing.T) {
 	usecase := project.NewUsecase(memory.New())
-	if _, err := usecase.Get(context.Background(), "missing"); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := usecase.Get(adminContext(), "missing"); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("Get missing = %v, want not found", err)
 	}
 }
@@ -73,8 +77,8 @@ func TestProjectOwnershipAndAccessControl(t *testing.T) {
 	ctxUserB := domain.WithIdentity(context.Background(), userB)
 	ctxAdmin := domain.WithIdentity(context.Background(), admin)
 
-	// User A creates Project A
-	createdA, err := usecase.Create(ctxUserA, "Alice Project")
+	// Admins create the projects with Alice and Bob as their initial owners.
+	createdA, err := usecase.Create(domain.WithIdentity(ctxUserA, domain.Identity{Email: userA.Email, Admin: true}), "Alice Project")
 	if err != nil {
 		t.Fatalf("create Alice project: %v", err)
 	}
@@ -82,8 +86,7 @@ func TestProjectOwnershipAndAccessControl(t *testing.T) {
 		t.Fatalf("OwnerEmail = %q, want alice@example.com", createdA.OwnerEmail)
 	}
 
-	// User B creates Project B
-	createdB, err := usecase.Create(ctxUserB, "Bob Project")
+	createdB, err := usecase.Create(domain.WithIdentity(ctxUserB, domain.Identity{Email: userB.Email, Admin: true}), "Bob Project")
 	if err != nil {
 		t.Fatalf("create Bob project: %v", err)
 	}
@@ -94,10 +97,10 @@ func TestProjectOwnershipAndAccessControl(t *testing.T) {
 		t.Fatalf("User A get Project A error = %v", err)
 	}
 
-	// User B CANNOT get Project A (must return ErrNotFound to avoid leaking existence)
+	// User B CANNOT get Project A (ErrAccessDenied maps to 404, so existence is not leaked)
 	_, err = usecase.Get(ctxUserB, createdA.ID)
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("User B get Project A error = %v, want ErrNotFound", err)
+	if !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("User B get Project A error = %v, want ErrAccessDenied", err)
 	}
 
 	// Admin CAN get Project A
@@ -150,10 +153,10 @@ func TestLegacyProjectAccess(t *testing.T) {
 	ctxUser := domain.WithIdentity(context.Background(), user)
 	ctxAdmin := domain.WithIdentity(context.Background(), admin)
 
-	// Regular user cannot get legacy project (returns ErrNotFound)
+	// Regular user cannot get legacy project (ErrAccessDenied maps to 404)
 	_, err := usecase.Get(ctxUser, "legacy1")
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("regular user get legacy error = %v, want ErrNotFound", err)
+	if !errors.Is(err, domain.ErrAccessDenied) {
+		t.Fatalf("regular user get legacy error = %v, want ErrAccessDenied", err)
 	}
 
 	// Regular user does not see legacy project in list

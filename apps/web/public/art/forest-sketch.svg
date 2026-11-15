@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 800" role="img" aria-label="Hand-drawn forest silhouette">
+<defs><linearGradient id="paper" x2="0" y2="1"><stop stop-color="#173229"/><stop offset="1" stop-color="#091611"/></linearGradient><filter id="rough"><feTurbulence type="fractalNoise" baseFrequency=".025" numOctaves="3" seed="8" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="4"/></filter></defs>
+<rect width="1440" height="800" fill="url(#paper)"/>
+<g fill="none" stroke="#7cae94" stroke-opacity=".48" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" filter="url(#rough)">
+<path d="M0 620 Q180 528 350 606 T710 610 T1080 590 T1440 610 M0 650 Q200 575 390 646 T800 645 T1440 636 M0 710 Q210 632 420 710 T850 700 T1440 705"/>
+<g id="pine"><path d="M0 0 L0 420 M-73 330 L0 82 73 330 -73 330 M-60 275 L0 56 60 275 M-45 214 L0 37 45 214 M-32 163 L0 20 32 163 M-19 104 L0 0 19 104 M-65 300 L60 301 M-51 245 L48 247 M-40 190 L36 191 M-23 137 L24 139"/></g>
+<use href="#pine" transform="translate(90 216) scale(.9)"/><use href="#pine" transform="translate(225 140) scale(1.2)"/><use href="#pine" transform="translate(385 248) scale(.8)"/><use href="#pine" transform="translate(530 112) scale(1.28)"/><use href="#pine" transform="translate(680 235) scale(.93)"/><use href="#pine" transform="translate(820 75) scale(1.35)"/><use href="#pine" transform="translate(990 220) scale(.95)"/><use href="#pine" transform="translate(1140 135) scale(1.2)"/><use href="#pine" transform="translate(1325 192) scale(1.02)"/>
+<path d="M0 755 Q250 702 420 754 T850 749 T1440 745 M20 765 l40 -20 m25 13 l35 -17 m50 9 l42 -19 m67 18 l45 -21 m99 10 l34 -14 m126 20 l36 -18 m131 14 l54 -20 m133 12 l49 -16 m121 20 l44 -16"/>
+</g></svg>

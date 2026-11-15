@@ -17,22 +17,27 @@ import (
 )
 
 const (
-	writeWait  = 5 * time.Second
-	pongWait   = 60 * time.Second
-	pingPeriod = 30 * time.Second
-	readLimit  = 512
+	writeWait        = 5 * time.Second
+	pongWait         = 60 * time.Second
+	pingPeriod       = 30 * time.Second
+	readLimit        = 512
+	maxConnectionAge = 5 * time.Minute
 )
 
 // Handler upgrades a request and streams snapshots and anomalies.
 type Handler struct {
-	projects       domain.ProjectRepository
-	records        domain.RecordRepository
-	hub            *Hub
-	window         time.Duration
-	allowedOrigins map[string]struct{}
-	logger         *slog.Logger
-	audit          domain.AuditSink
-	upgrader       websocket.Upgrader
+	projects     domain.ProjectRepository
+	records      domain.RecordRepository
+	snapshots    domain.SnapshotProvider
+	initialSlots chan struct{}
+	hub          *Hub
+	window       time.Duration
+	// Fixed authentication lifetime, independent of the sliding pong deadline.
+	maxConnectionAge time.Duration
+	allowedOrigins   map[string]struct{}
+	logger           *slog.Logger
+	audit            domain.AuditSink
+	upgrader         websocket.Upgrader
 }
 
 // NewHandler wires the WebSocket delivery layer. The audit sink is nil-safe:
@@ -45,6 +50,7 @@ func NewHandler(
 	allowedOrigins map[string]struct{},
 	logger *slog.Logger,
 	audit domain.AuditSink,
+	snapshots ...domain.SnapshotProvider,
 ) *Handler {
 	if window <= 0 {
 		window = 60 * time.Second
@@ -54,13 +60,18 @@ func NewHandler(
 	}
 
 	handler := &Handler{
-		projects:       projects,
-		records:        records,
-		hub:            hub,
-		window:         window,
-		allowedOrigins: allowedOrigins,
-		logger:         logger,
-		audit:          audit,
+		projects:         projects,
+		records:          records,
+		initialSlots:     make(chan struct{}, 8),
+		hub:              hub,
+		window:           window,
+		maxConnectionAge: maxConnectionAge,
+		allowedOrigins:   allowedOrigins,
+		logger:           logger,
+		audit:            audit,
+	}
+	if len(snapshots) > 0 {
+		handler.snapshots = snapshots[0]
 	}
 	handler.upgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -98,7 +109,7 @@ func (h *Handler) recordAccessDenied(r *http.Request, actorEmail, projectID stri
 	if h.audit == nil {
 		return
 	}
-	h.audit.Record(r.Context(), domain.AuditEvent{
+	_ = h.audit.Record(r.Context(), domain.AuditEvent{
 		Ts:              time.Now().UTC(),
 		ActorEmail:      domain.SanitizeActor(actorEmail),
 		Action:          domain.AuditAccessDenied,
@@ -111,6 +122,18 @@ func (h *Handler) recordAccessDenied(r *http.Request, actorEmail, projectID stri
 
 // ServeHTTP handles GET /ws/{projectID}.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Start at the authenticated request, not after snapshot loading. Reconnecting
+	// must pass through the edge's SSO check and project authorization again.
+	expiresAt := time.Now().Add(h.maxConnectionAge)
+	ctx, cancel := context.WithDeadline(r.Context(), expiresAt)
+	defer cancel()
+	r = r.WithContext(ctx)
+
+	identity, err := domain.RequireIdentity(r.Context())
+	if err != nil {
+		httpx.Error(w, r, err)
+		return
+	}
 	projectID := chi.URLParam(r, "projectID")
 	if projectID == "" {
 		httpx.Error(w, r, domain.Validationf("project id is required"))
@@ -122,7 +145,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, err)
 		return
 	}
-	if identity, ok := domain.IdentityFrom(r.Context()); ok && !p.CanAccess(identity) {
+	if !p.CanAccess(identity) {
 		h.recordAccessDenied(r, identity.Email, projectID)
 		httpx.Error(w, r, domain.ErrNotFound)
 		return
@@ -134,8 +157,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("websocket upgrade failed", "project_id", projectID, "error", err)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
+	// Run outside the writer loop so a slow snapshot, access fence, full socket,
+	// or continuous traffic cannot postpone reauthentication. WriteControl and
+	// Close may run concurrently with the reader/writer. Application writes are
+	// also capped at expiresAt; only the close frame gets a bounded grace period.
+	expiryTimer := time.AfterFunc(time.Until(expiresAt), func() {
+		defer func() { _ = conn.Close() }()
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseGoingAway, "authentication refresh required"),
+			time.Now().Add(writeWait))
+	})
+	defer expiryTimer.Stop()
+
+	// Ownership may change after the first lookup but before registration. Recheck
+	// under the same fence used by ownership changes and project deletion.
+	h.hub.accessMu.RLock()
+	current, err := h.projects.Get(r.Context(), projectID)
+	if err != nil || ctx.Err() != nil || !current.CanAccess(identity) {
+		h.hub.accessMu.RUnlock()
+		if err == nil && !current.CanAccess(identity) {
+			h.recordAccessDenied(r, identity.Email, projectID)
+		}
+		return
+	}
 	client := h.hub.Register(projectID)
 	defer h.hub.Unregister(projectID, client)
 
@@ -155,9 +201,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if !h.sendInitialSnapshot(conn, projectID) {
+	if !h.sendInitialSnapshot(ctx, conn, projectID, expiresAt) {
+		h.hub.accessMu.RUnlock()
 		return
 	}
+	h.hub.accessMu.RUnlock()
 
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
@@ -168,26 +216,69 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 
 		case message := <-client.Send():
-			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			h.hub.accessMu.RLock()
+			// A queued message can race a closed client; do not write it after
+			// ownership changes or deletion have returned.
+			select {
+			case <-client.Done():
+				h.hub.accessMu.RUnlock()
+				return
+			default:
+			}
+			_ = conn.SetWriteDeadline(streamWriteDeadline(expiresAt))
+			err := conn.WriteMessage(websocket.TextMessage, message)
+			h.hub.accessMu.RUnlock()
+			if err != nil {
 				return
 			}
 
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+			if err := conn.WriteControl(websocket.PingMessage, nil, streamWriteDeadline(expiresAt)); err != nil {
 				return
 			}
 		}
 	}
 }
 
-func (h *Handler) sendInitialSnapshot(conn *websocket.Conn, projectID string) bool {
-	records, err := h.records.Recent(context.Background(), projectID, time.Now().Add(-h.window))
-	if err != nil {
-		h.logger.Error("read records for initial snapshot", "project_id", projectID, "error", err)
+// streamWriteDeadline prevents data writes (including an in-flight write) from
+// extending the authentication lifetime while retaining the usual I/O timeout.
+func streamWriteDeadline(expiresAt time.Time) time.Time {
+	deadline := time.Now().Add(writeWait)
+	if expiresAt.Before(deadline) {
+		return expiresAt
 	}
+	return deadline
+}
 
-	snapshot := domain.Compute(records, int(h.window.Seconds()))
+func (h *Handler) sendInitialSnapshot(ctx context.Context, conn *websocket.Conn, projectID string, expiresAt time.Time) bool {
+	// Include socket serialization/write in the admission interval: slow new
+	// subscribers must not hold unbounded full snapshots concurrently.
+	select {
+	case h.initialSlots <- struct{}{}:
+		defer func() { <-h.initialSlots }()
+	case <-ctx.Done():
+		return false
+	default:
+		return false
+	}
+	var snapshot domain.Snapshot
+	var err error
+	if h.snapshots != nil {
+		snapshot, err = h.snapshots.Current(ctx, projectID)
+	} else {
+		var records []domain.LogRecord
+		records, err = h.records.Recent(ctx, projectID, time.Now().Add(-h.window))
+		if err == nil {
+			snapshot = domain.Compute(records, int(h.window.Seconds()))
+		}
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	if err != nil {
+		h.logger.Warn("initial snapshot unavailable", "project_id", projectID, "error", err)
+		return false
+	}
 	envelope := Envelope{
 		EventType: EventMetricSnapshot,
 		ProjectID: projectID,
@@ -195,6 +286,6 @@ func (h *Handler) sendInitialSnapshot(conn *websocket.Conn, projectID string) bo
 		Data:      snapshot,
 	}
 
-	_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+	_ = conn.SetWriteDeadline(streamWriteDeadline(expiresAt))
 	return conn.WriteJSON(envelope) == nil
 }

@@ -26,6 +26,15 @@ export function formatClock(iso: string): string {
   }).format(date);
 }
 
+export function formatTimestamp(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(date);
+}
+
 export function formatRelative(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "—";

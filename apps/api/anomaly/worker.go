@@ -2,6 +2,7 @@ package anomaly
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -13,6 +14,10 @@ import (
 // broadcasts it, and hands it to the anomaly evaluator. It also prunes old
 // snapshots so the database does not grow without bound.
 type Worker struct {
+	gate        domain.ProjectGate
+	projects    domain.ProjectRepository
+	cycleMu     sync.Mutex
+	parallelism int
 	recorder    domain.RecordRepository
 	snapshots   domain.SnapshotProvider
 	store       domain.SnapshotRepository
@@ -37,6 +42,8 @@ func NewWorker(
 	broadcaster domain.Broadcaster,
 	interval, retention time.Duration,
 	logger *slog.Logger,
+	projects domain.ProjectRepository,
+	gate domain.ProjectGate,
 ) *Worker {
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -45,6 +52,9 @@ func NewWorker(
 		logger = slog.Default()
 	}
 	return &Worker{
+		gate:        gate,
+		projects:    projects,
+		parallelism: 4,
 		recorder:    recorder,
 		snapshots:   snapshots,
 		store:       store,
@@ -90,16 +100,49 @@ func (w *Worker) EvaluateAll(ctx context.Context) {
 		return
 	}
 
-	for _, projectID := range w.recorder.ActiveProjects(ctx) {
+	// Do not overlap cycles (or retention pruning) if an external trigger races
+	// the ticker. Bounded parallelism isolates projects without unbounded work.
+	w.cycleMu.Lock()
+	defer w.cycleMu.Unlock()
+	started := time.Now()
+	ids := w.recorder.ActiveProjects(ctx)
+	defer func() {
+		duration := time.Since(started)
+		w.logger.Debug("snapshot cycle", "projects", len(ids), "duration", duration)
+		if duration > w.interval {
+			w.logger.Warn("snapshot cycle exceeded interval", "projects", len(ids), "duration", duration, "interval", w.interval)
+		}
+	}()
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	for i := 0; i < min(w.parallelism, len(ids)); i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for id := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				case <-w.stop:
+					return
+				default:
+				}
+				w.EvaluateProject(ctx, id)
+			}
+		}()
+	}
+dispatch:
+	for _, id := range ids {
 		select {
 		case <-ctx.Done():
-			return
+			break dispatch
 		case <-w.stop:
-			return
-		default:
-			w.EvaluateProject(ctx, projectID)
+			break dispatch
+		case jobs <- id:
 		}
 	}
+	close(jobs)
+	workers.Wait()
 
 	if w.retention > 0 && w.store != nil && (w.lastPrune.IsZero() || time.Since(w.lastPrune) >= time.Hour) {
 		pruned, err := w.store.Prune(ctx, time.Now().Add(-w.retention))
@@ -114,6 +157,19 @@ func (w *Worker) EvaluateAll(ctx context.Context) {
 
 // EvaluateProject computes one snapshot and drives the pipeline for it.
 func (w *Worker) EvaluateProject(ctx context.Context, projectID string) {
+	unlock, err := w.gate.Lock(ctx, projectID)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	// ActiveProjects may have been read before deletion. Never compute/persist
+	// for that stale ID, even if an empty snapshot would otherwise look valid.
+	if _, err := w.projects.Get(ctx, projectID); err != nil {
+		if !errors.Is(err, domain.ErrNotFound) {
+			w.logger.Error("read project for snapshot", "project_id", projectID, "error", err)
+		}
+		return
+	}
 	snapshot, err := w.snapshots.Current(ctx, projectID)
 	if err != nil {
 		w.logger.Error("compute snapshot", "project_id", projectID, "error", err)
@@ -123,6 +179,7 @@ func (w *Worker) EvaluateProject(ctx context.Context, projectID string) {
 	if w.store != nil {
 		if err := w.store.Save(ctx, projectID, snapshot); err != nil {
 			w.logger.Error("save snapshot", "project_id", projectID, "error", err)
+			return
 		}
 	}
 

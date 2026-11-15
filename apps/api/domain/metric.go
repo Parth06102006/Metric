@@ -28,12 +28,16 @@ func (r LogRecord) Validate() error {
 		return Validationf("log record endpoint is required")
 	case strings.TrimSpace(r.Method) == "":
 		return Validationf("log record method is required")
+	case len(r.Endpoint) > 2048:
+		return Validationf("log record endpoint exceeds 2048 bytes")
+	case len(r.Method) > 16:
+		return Validationf("log record method exceeds 16 bytes")
 	case r.Status < 100 || r.Status > 599:
 		return Validationf("log record status must be a valid HTTP status")
-	case r.LatencyMs < 0:
-		return Validationf("log record latency must be non-negative")
-	case r.PayloadBytes < 0:
-		return Validationf("log record payload size must be non-negative")
+	case math.IsNaN(r.LatencyMs) || math.IsInf(r.LatencyMs, 0) || r.LatencyMs < 0 || r.LatencyMs > 24*60*60*1000:
+		return Validationf("log record latency must be finite and between 0 and 86400000 ms")
+	case r.PayloadBytes < 0 || r.PayloadBytes > 1<<40:
+		return Validationf("log record payload size must be between 0 and 1 TiB")
 	case net.ParseIP(r.IP) == nil:
 		return Validationf("log record IP is invalid")
 	}
@@ -53,6 +57,9 @@ type Snapshot struct {
 	TopIPRPS        float64        `json:"top_ip_rps"`
 	AvgPayloadBytes float64        `json:"avg_payload_bytes"`
 	Endpoints       map[string]int `json:"endpoints"`
+	// Transient evidence for analysis jobs, not part of the snapshot API or history.
+	SampleCount     *int              `json:"-"`
+	EndpointSummary *EndpointEvidence `json:"-"`
 }
 
 // Compute calculates a snapshot using the current time.
@@ -72,22 +79,56 @@ func ComputeAt(records []LogRecord, windowSeconds int, now time.Time) Snapshot {
 		return result
 	}
 
-	ips := make(map[string]int, len(records))
+	// Bound the IP map by actual cardinality, not raw request count. A window
+	// with many requests from a few IPs otherwise overallocates megabytes.
+	ips := make(map[string]int)
 	latencies := make([]float64, 0, len(records))
 
 	var errorCount int
-	var totalPayloadBytes int64
+	var totalPayloadBytes float64
+	type endpointStats struct {
+		latencies []float64
+		errors    int
+	}
+	endpointData := make(map[string]*endpointStats)
 
 	for _, record := range records {
 		latencies = append(latencies, record.LatencyMs)
 		result.Endpoints[record.Endpoint]++
+		stats := endpointData[record.Endpoint]
+		if stats == nil {
+			stats = &endpointStats{}
+			endpointData[record.Endpoint] = stats
+		}
+		stats.latencies = append(stats.latencies, record.LatencyMs)
+		if record.Status >= 500 {
+			stats.errors++
+		}
 		ips[record.IP]++
-		totalPayloadBytes += int64(record.PayloadBytes)
+		totalPayloadBytes += float64(record.PayloadBytes)
 
 		if record.Status >= 500 {
 			errorCount++
 		}
 	}
+
+	count := len(records)
+	result.SampleCount = &count
+	summary := &EndpointEvidence{EndpointCount: len(endpointData)}
+	for _, stats := range endpointData {
+		if stats.errors > 0 {
+			summary.EndpointsWithErrors++
+		}
+		if stats.errors > summary.MostErrors || (stats.errors == summary.MostErrors && len(stats.latencies) > summary.MostErrorsSamples) {
+			summary.MostErrors, summary.MostErrorsSamples = stats.errors, len(stats.latencies)
+		}
+		sort.Float64s(stats.latencies)
+		p95 := percentile(stats.latencies, 0.95)
+		if p95 > summary.SlowestP95 || (p95 == summary.SlowestP95 && len(stats.latencies) > summary.SlowestP95Samples) {
+			summary.SlowestP95, summary.SlowestP95Samples = p95, len(stats.latencies)
+		}
+	}
+	result.EndpointSummary = summary
 
 	result.RPS = float64(len(records)) / float64(windowSeconds)
 	result.ErrorRate = float64(errorCount) * 100 / float64(len(records))
@@ -100,7 +141,7 @@ func ComputeAt(records []LogRecord, windowSeconds int, now time.Time) Snapshot {
 		}
 	}
 	result.TopIPRPS = float64(busiestIPCount) / float64(windowSeconds)
-	result.AvgPayloadBytes = float64(totalPayloadBytes) / float64(len(records))
+	result.AvgPayloadBytes = totalPayloadBytes / float64(len(records))
 
 	sort.Float64s(latencies)
 	result.P50 = percentile(latencies, 0.50)

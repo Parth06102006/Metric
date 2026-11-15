@@ -34,35 +34,90 @@ type Config struct {
 	ReadHeaderTimeout time.Duration
 	ShutdownTimeout   time.Duration
 
-	GeminiAPIKey string
-	GeminiModel  string
+	MaxProjectRecords   int
+	MaxProjectEndpoints int
+	MaxTotalRecords     int
+	MaxLiveProjects     int
+	MaxProjectBytes     int64
+	MaxTotalBytes       int64
+	IngestConcurrency   int
+	SQLiteMaxBytes      int64
+	MinFreeDiskBytes    int64
+
+	GeminiAPIKey        string
+	GeminiModel         string
+	GeminiMaxDailyCalls int
 }
 
 // Load reads configuration from the environment and applies safe defaults.
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:              env("ADDR", ":8080"),
-		DatabasePath:      env("DATABASE_PATH", "traffic.db"),
-		Env:               env("APP_ENV", "development"),
-		LogLevel:          env("LOG_LEVEL", "info"),
-		AuthMode:          env("AUTH_MODE", ""),
-		AuthEmailHeader:   env("AUTH_EMAIL_HEADER", "X-Auth-Request-Email"),
-		AuthUserHeader:    env("AUTH_USER_HEADER", "X-Auth-Request-User"),
-		ProxySecret:       os.Getenv("PROXY_SHARED_SECRET"),
-		DevEmail:          env("DEV_USER_EMAIL", "dev@localhost"),
-		AdminEmails:       csvSet(os.Getenv("ADMIN_EMAILS")),
-		TrustProxy:        envBool("TRUST_PROXY", true),
-		AllowedOrigins:    csvSet(os.Getenv("ALLOWED_ORIGINS")),
-		MetricsWindow:     envDuration("METRICS_WINDOW", 60*time.Second),
-		WorkerInterval:    envDuration("WORKER_INTERVAL", 5*time.Second),
-		DedupeWindow:      envDuration("DEDUPE_WINDOW", 60*time.Second),
-		SnapshotRetention: envDuration("SNAPSHOT_RETENTION", 7*24*time.Hour),
-		AuditRetention:    envDuration("AUDIT_RETENTION", 90*24*time.Hour),
-		APITimeout:        envDuration("API_TIMEOUT", 15*time.Second),
-		ReadHeaderTimeout: envDuration("READ_HEADER_TIMEOUT", 5*time.Second),
-		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
-		GeminiAPIKey:      os.Getenv("GEMINI_API_KEY"),
-		GeminiModel:       env("GEMINI_MODEL", "gemini-2.0-flash"),
+		Addr:                env("ADDR", ":8080"),
+		DatabasePath:        env("DATABASE_PATH", "traffic.db"),
+		Env:                 env("APP_ENV", "development"),
+		LogLevel:            env("LOG_LEVEL", "info"),
+		AuthMode:            env("AUTH_MODE", ""),
+		AuthEmailHeader:     env("AUTH_EMAIL_HEADER", "X-Auth-Request-Email"),
+		AuthUserHeader:      env("AUTH_USER_HEADER", "X-Auth-Request-User"),
+		ProxySecret:         os.Getenv("PROXY_SHARED_SECRET"),
+		DevEmail:            env("DEV_USER_EMAIL", "dev@localhost"),
+		AdminEmails:         csvSet(os.Getenv("ADMIN_EMAILS")),
+		TrustProxy:          envBool("TRUST_PROXY", true),
+		AllowedOrigins:      csvSet(os.Getenv("ALLOWED_ORIGINS")),
+		MetricsWindow:       envDuration("METRICS_WINDOW", 60*time.Second),
+		WorkerInterval:      envDuration("WORKER_INTERVAL", 5*time.Second),
+		DedupeWindow:        envDuration("DEDUPE_WINDOW", 60*time.Second),
+		SnapshotRetention:   envDuration("SNAPSHOT_RETENTION", 7*24*time.Hour),
+		AuditRetention:      envDuration("AUDIT_RETENTION", 90*24*time.Hour),
+		APITimeout:          envDuration("API_TIMEOUT", 15*time.Second),
+		ReadHeaderTimeout:   envDuration("READ_HEADER_TIMEOUT", 5*time.Second),
+		ShutdownTimeout:     envDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+		GeminiAPIKey:        os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:         env("GEMINI_MODEL", "gemini-decision-1"),
+		GeminiMaxDailyCalls: 100,
+		MaxProjectRecords:   50000,
+		MaxProjectEndpoints: 512,
+		MaxTotalRecords:     200000,
+		MaxLiveProjects:     512,
+		MaxProjectBytes:     16 << 20,
+		MaxTotalBytes:       64 << 20,
+		IngestConcurrency:   16,
+		SQLiteMaxBytes:      2 << 30,
+		MinFreeDiskBytes:    256 << 20,
+	}
+
+	for key, target := range map[string]*int{
+		"MAX_PROJECT_RECORDS": &cfg.MaxProjectRecords, "MAX_PROJECT_ENDPOINTS": &cfg.MaxProjectEndpoints, "MAX_TOTAL_RECORDS": &cfg.MaxTotalRecords,
+		"MAX_LIVE_PROJECTS": &cfg.MaxLiveProjects, "INGEST_CONCURRENCY": &cfg.IngestConcurrency, "GEMINI_MAX_DAILY_CALLS": &cfg.GeminiMaxDailyCalls,
+	} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			v, err := strconv.Atoi(value)
+			if err != nil || v <= 0 || v > 10000000 {
+				return Config{}, fmt.Errorf("%s must be between 1 and 10000000", key)
+			}
+			*target = v
+		}
+	}
+	for key, target := range map[string]*int64{"MAX_PROJECT_BYTES": &cfg.MaxProjectBytes, "MAX_TOTAL_BYTES": &cfg.MaxTotalBytes} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || v <= 0 || v > 1<<40 {
+				return Config{}, fmt.Errorf("%s must be between 1 and 1099511627776", key)
+			}
+			*target = v
+		}
+	}
+	for key, target := range map[string]*int64{"SQLITE_MAX_BYTES": &cfg.SQLiteMaxBytes, "MIN_FREE_DISK_BYTES": &cfg.MinFreeDiskBytes} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil || v < 1<<20 || v > 1<<40 {
+				return Config{}, fmt.Errorf("%s must be between 1048576 and 1099511627776", key)
+			}
+			*target = v
+		}
+	}
+	if cfg.GeminiAPIKey != "" && cfg.GeminiModel != "gemini-decision-1" {
+		return Config{}, fmt.Errorf("GEMINI_MODEL must be gemini-decision-1 for the Decisions API")
 	}
 
 	if port := os.Getenv("PORT"); port != "" {

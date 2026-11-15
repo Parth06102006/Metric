@@ -41,6 +41,13 @@ func TestCompute(t *testing.T) {
 	if snapshot.Endpoints["/a"] != 2 || snapshot.Endpoints["/b"] != 1 {
 		t.Fatalf("Endpoints = %v", snapshot.Endpoints)
 	}
+	if snapshot.SampleCount == nil || *snapshot.SampleCount != 3 {
+		t.Fatalf("sample count = %v", snapshot.SampleCount)
+	}
+	e := snapshot.EndpointSummary
+	if e == nil || e.EndpointCount != 2 || e.EndpointsWithErrors != 1 || e.MostErrors != 1 || e.MostErrorsSamples != 1 || e.SlowestP95 != 30 || e.SlowestP95Samples != 1 {
+		t.Fatalf("endpoint evidence = %+v", e)
+	}
 }
 
 func TestComputeEmptyAndZeroWindow(t *testing.T) {

@@ -7,7 +7,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"traffic-center/audit"
 	"traffic-center/domain"
 	"traffic-center/ingest"
 	"traffic-center/internal/httpx"
@@ -16,12 +15,12 @@ import (
 // IngestHandler accepts batches of request logs.
 type IngestHandler struct {
 	usecase *ingest.Usecase
-	audit   *audit.Usecase
+	audit   domain.AuditSink
 }
 
 // NewIngestHandler wires the ingest handler.
-func NewIngestHandler(usecase *ingest.Usecase, events *audit.Usecase) *IngestHandler {
-	return &IngestHandler{usecase: usecase, audit: events}
+func NewIngestHandler(usecase *ingest.Usecase, audit domain.AuditSink) *IngestHandler {
+	return &IngestHandler{usecase: usecase, audit: audit}
 }
 
 type ingestRequest struct {
@@ -56,7 +55,7 @@ func (h *IngestHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 		// Failed machine authentication is security-relevant: the project
 		// target is recorded, the presented key never is.
 		if errors.Is(err, domain.ErrUnauthorized) {
-			h.audit.Log(r.Context(), "", domain.AuditIngestDenied, chi.URLParam(r, "projectID"),
+			logAudit(h.audit, r.Context(), "", domain.AuditIngestDenied, chi.URLParam(r, "projectID"),
 				domain.AuditOutcomeFailure, map[string]string{"path": r.URL.Path})
 		}
 		httpx.Error(w, r, err)

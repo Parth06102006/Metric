@@ -27,8 +27,8 @@ identity with headers.
 
 - Multi-region or horizontal scaling. The in-memory request window and SQLite
   make this a single-writer system.
-- Long-term raw request storage. Only computed snapshots and anomalies are
-  persisted.
+- Long-term raw request storage. Raw records are journaled for restart recovery
+  and pruned after expiry, though SQLite and backups may retain deleted bytes.
 - A general-purpose alerting system. Rules are fixed and threshold-based.
 
 ## 2. Topology
@@ -71,9 +71,16 @@ the host.
    `X-Proxy-Secret`.
 4. Go's identity middleware validates the optional secret, requires an email,
    and stores a `domain.Identity` on the request context.
-5. `RequireAdmin` guards project creation and threshold updates. With an empty
-   `ADMIN_EMAILS`, nobody is an admin: the behavior is fail-closed.
-6. The handler decodes JSON, calls one usecase, and writes the result. Domain
+5. Routes that mutate or expose cross-tenant material add `RequireAdmin`:
+   project creation, owner assignment, key rotate/revoke, threshold updates,
+   project deletion, and the audit feed. With an empty `ADMIN_EMAILS`, nobody is
+   an admin: the behavior is fail-closed.
+6. Project-scoped reads check `project.CanAccess(identity)` in the usecase. A
+   caller who is not the owner and not an admin gets `domain.ErrAccessDenied`,
+   which delivery maps to the same 404 as a missing project, so responses never
+   reveal whether a project exists. The handler still records an
+   `access.denied` audit event.
+7. The handler decodes JSON, calls one usecase, and writes the result. Domain
    errors become 400/401/403/404/409/500 in `internal/httpx`.
 
 ### Ingest — `/ingest/{projectID}`
@@ -83,20 +90,36 @@ the host.
 3. The ingest usecase checks `X-API-Key` against the stored SHA-256 hash using
    `subtle.ConstantTimeCompare`. A missing project and a wrong key both return
    401, so project IDs cannot be enumerated.
-4. Records are validated (timestamp, endpoint, method, status, latency, payload,
-   parseable IP), then appended to the project's in-memory rolling window.
-5. Response: `202 {"accepted": n}`.
+4. Timestamps must be within the live window and no more than five seconds
+   ahead; small future skew is clamped. Field lengths, numeric values, per-project
+   endpoint cardinality, retained record counts and estimated bytes are bounded.
+   Concurrent ingestion and body size are also capped. A capacity failure returns
+   HTTP 429 with Retry-After without a partial batch; clients should back off.
+5. The memory window reserves capacity, then a FULL-synchronous SQLite WAL
+   transaction journals the batch before it is published or a 202 is returned.
+   Live records are reloaded on restart; old batches are pruned incrementally.
+   Low disk and journal failures return 503. Uncertain responses can yield
+   duplicates on retry. The journal includes IPs and paths; deleted bytes can
+   persist in free pages, WAL and backups.
+6. SQLite main-file pages have a configurable cap, while a free-space check
+   rejects ingestion before its reserve is consumed. Neither limits WAL, other
+   processes or all filesystem usage; memory limits do not cap total RSS.
 
 ### Live stream — `/ws/{projectID}`
 
 1. Caddy authenticates the handshake exactly like `/api`, then proxies with
    `flush_interval -1`.
-2. The Go handler checks the project exists, upgrades the connection, and
-   registers a subscriber with the hub.
+2. The Go handler checks the caller is an owner, viewer, or admin. An unauthorized
+   handshake gets the same 404 as a missing project. After upgrading, it rechecks
+   access before registration to close a race with access changes or deletion.
 3. It immediately writes a snapshot computed from the current window, then
-   forwards hub messages until the client disconnects or its read deadline
-   expires.
-4. The hub sends a ping every 30 seconds; the read deadline is 60 seconds.
+   forwards hub messages until the client disconnects, its read deadline
+   expires, access changes, or the project is deleted. Ownership changes and
+   viewer removals disconnect all subscribers; authorized clients may reconnect.
+4. A process-local stream fence coordinates registration and writes with access
+   changes and deletion. These mutations may wait for an in-progress WebSocket
+   write (up to its 5-second deadline); this is not a multi-process fence.
+5. The hub sends a ping every 30 seconds; the read deadline is 60 seconds.
 
 Origin policy: same-host handshakes are allowed (Caddy preserves `Host`), as are
 hosts listed in `ALLOWED_ORIGINS`. A missing `Origin` is allowed for non-browser
@@ -104,7 +127,20 @@ clients.
 
 ### Background pipeline
 
-The anomaly worker ticks every `WORKER_INTERVAL` (5s default):
+The anomaly worker ticks every `WORKER_INTERVAL` (5s default). A bounded pool of
+four workers evaluates different projects concurrently; cycles do not overlap.
+Each evaluation acquires the shared per-project operation gate and rechecks
+project existence. Ingestion holds that gate from authentication through append;
+deletion holds it through database deletion, stream disconnection and live-window
+cleanup. Key rotation and revocation also take the same gate. Lock order is operation gate → stream-access fence → repositories.
+Thus deletion waits for earlier work, and queued ingestion/evaluation checks the
+deleted project afresh. Idle gate entries are released rather than retained.
+This coordination is process-local, not a multi-replica protocol.
+
+Cycle duration and active-project count are logged at debug level; cycles that
+exceed `WORKER_INTERVAL` produce a warning. Snapshot persistence failure stops
+that project's publication/evaluation for the cycle.
+
 
 ```text
 ActiveProjects()
@@ -119,14 +155,19 @@ metrics.Usecase.Current()  ──▶ domain.Compute(records, window)
                  ├── ThresholdRepository.Get() (defaults when absent)
                  ├── domain.Detect(snapshot, thresholds)
                  ├── AnomalyRepository.HasRecent(type, dedupe window)
-                 ├── Explainer.Explain() (Gemini or deterministic fallback)
-                 ├── AnomalyRepository.Save()
+                 ├── save rule-based anomaly + bounded job transactionally
                  └── Hub.BroadcastAnomaly()
+                            │
+                            ▼
+                background worker → Gemini Decisions → save advisory result → broadcast update
 ```
 
 Snapshots older than `SNAPSHOT_RETENTION` are pruned at most once an hour.
 `ActiveProjects` also drops projects whose live window is empty, so idle
-projects stop generating rows.
+projects stop generating rows. A separate hourly job prunes audit events older
+than `AUDIT_RETENTION`. Analysis dispatch is durably reserved against a UTC-day
+call cap; an interrupted or failed provider call is not retried, to avoid a
+second potentially billed call. This sacrifices some advisory results.
 
 ## 4. Backend structure
 
@@ -137,7 +178,8 @@ apps/api/
     project.go threshold.go metric.go anomaly.go identity.go
     ports.go errors.go ids.go
   project/
-    usecase.go
+    usecase.go                 read/create with ownership checks
+    lifecycle.go               rotate/revoke/delete/assign owner
     repository/memory/
     repository/sqlite/
   threshold/
@@ -149,8 +191,12 @@ apps/api/
     repository/sqlite/         snapshots
   ingest/usecase.go
   anomaly/
-    usecase.go                 evaluate + dedupe + explain + publish
+    usecase.go                 evaluate + dedupe + queue + publish
     worker.go                  periodic pipeline
+    repository/{memory,sqlite}/
+  audit/
+    usecase.go                 record (redacted) + filtered reads
+    pruner.go                  hourly retention job
     repository/{memory,sqlite}/
   internal/
     config/                    env parsing and production guards
@@ -160,7 +206,8 @@ apps/api/
                                identity, admin, timeout
     rest/                      HTTP handlers per feature
     ws/                        hub + websocket handler
-    llm/                       Gemini explainer with fallback
+    gemini/                    Gemini Decisions API incident-analysis adapter
+    analysis/                  durable background job worker
     sqlite/                    connection, pragmas, schema migration
     server/                    chi route map and middleware wiring
 ```
@@ -169,7 +216,7 @@ apps/api/
 
 `domain` imports only the standard library. Feature usecases import `domain`
 and define behaviour in terms of its ports. Adapters (`repository/*`,
-`internal/llm`, `internal/ws`) implement those ports. Delivery
+`internal/ws`) implement those ports. Delivery
 (`internal/rest`) depends on usecases, never on repositories. The composition
 root is the only place that knows every concrete type.
 
@@ -189,6 +236,28 @@ keeps feature modules independent.
 - `domain.HashAPIKey` uses SHA-256. Keys are 32 random bytes rendered as hex;
   there is no low-entropy secret to brute-force.
 - Project IDs are 8 random bytes (16 hex characters).
+- `domain.ValidateEmail` shape-checks owner emails (empty means no owner) and
+  `domain.SanitizeActor` lowercases/normalizes every recorded actor.
+
+### Audit log
+
+`domain.AuditEvent` is the single record shape: id, UTC timestamp, actor email,
+action, target project, outcome, request ID, and a string map of curated
+details. Actions are constants (`project.create`, `project.owner.assign`,
+`api_key.rotate`, `access.denied`, …) so the feed stays filterable and no
+handler invents free-form strings.
+
+- Write path: `domain.AuditSink` is the minimal port. `audit.Usecase` implements
+  it, redacts credential-shaped detail keys (`domain.RedactDetails`), stamps the
+  request ID, and logs a write failure at ERROR without failing the request. A
+  nil sink is a no-op, so delivery never depends on the audit subsystem being
+  wired.
+- Read path: `AuditRepository.List` takes `domain.AuditQuery` (limit, action,
+  project, composite `before`/`before_id` cursor). The usecase clamps the limit;
+  the REST handler validates the cursor and returns 400 on malformed input.
+- Retention: `audit.Pruner` deletes rows older than `AUDIT_RETENTION` at most
+  once an hour. There is intentionally no HTTP route that updates or deletes
+  audit rows.
 
 ### Delivery middleware
 
@@ -210,15 +279,18 @@ RequestID → StripSlashes → RealIP → Logger → Recoverer → route
 
 ## 5. Data model
 
-SQLite runs with WAL, `busy_timeout=5000`, foreign keys, and
-`SetMaxOpenConns(1)` to serialize writers.
+SQLite runs with WAL, `busy_timeout=5000`, per-connection foreign keys, and a
+10-connection pool. Immediate write transactions reserve SQLite's single writer
+before reads; additional connections do not create parallel SQLite writers.
 
 ```sql
 projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   api_key_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  owner_email TEXT NOT NULL DEFAULT '',      -- '' = no owner (viewers may be granted separately)
+  api_key_revoked INTEGER NOT NULL DEFAULT 0 -- 1 rejects ingest until rotation
 )
 
 thresholds (
@@ -231,7 +303,7 @@ thresholds (
 
 metric_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   ts INTEGER NOT NULL,              -- unix milliseconds
   window_s INTEGER NOT NULL,
   rps REAL, p50 REAL, p95 REAL, p99 REAL,
@@ -243,7 +315,7 @@ metric_snapshots (
 
 anomalies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   type TEXT NOT NULL,
   severity TEXT NOT NULL,
   message TEXT NOT NULL,
@@ -254,34 +326,75 @@ anomalies (
 )
 -- indexes: (project_id, detected_at DESC),
 --          (project_id, type, detected_at DESC)
+
+audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,                 -- unix milliseconds
+  actor_email TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  target_project_id TEXT NOT NULL DEFAULT '',
+  outcome TEXT NOT NULL,               -- success | failure
+  request_id TEXT NOT NULL DEFAULT '',
+  details_json TEXT NOT NULL DEFAULT '{}'
+)
+-- indexes: (ts DESC), (action, ts DESC)
 ```
 
-`endpoints_json` is the only embedded document left: it is a variable-size map
-with no query requirements. Everything used for filtering or ordering is a real
-column.
+`endpoints_json`, analysis evidence and live journal batches are embedded
+JSON; indexed columns provide project and time filtering.
 
 ### Migration
 
 `internal/sqlite.Migrate` runs on startup and is idempotent:
 
 1. Create `projects` and `thresholds` if absent.
-2. If `metric_snapshots` has a `data_json` column, read the legacy rows, rename
+2. Add `owner_email` and `api_key_revoked` to an existing `projects` table.
+   Existing rows default to `''` and `0`, so pre-ownership projects stay
+   admin-only until an owner is assigned.
+3. If `metric_snapshots` has a `data_json` column, read the legacy rows, rename
    the table to `metric_snapshots_legacy_v1`, create the typed table, and copy
    parsed values.
-3. If `anomalies` has `summary` and no `type`, do the same into
+4. If `anomalies` has `summary` and no `type`, do the same into
    `anomalies_legacy_v1`, splitting `"type: message"` summaries.
-4. Drop the unused `alerts` table.
-5. Set `PRAGMA user_version = 2`.
+5. Create the snapshot, anomaly, and audit tables with their indexes.
+6. Drop the unused `alerts` table.
+7. Add diagnosis fields and durable analysis jobs.
+8. Add the authenticated user directory and view-only project memberships.
+9. Transactionally rebuild snapshots, anomalies and analysis jobs with project
+   foreign keys and cascading deletion. Preserve valid row IDs, diagnosis fields,
+   pending/processing jobs, leases and AUTOINCREMENT high-water marks; discard
+   rows whose parent project/incident no longer exists. Verify foreign keys.
+10. Schema v9 adds the live journal and daily analysis-call counter. On upgrade,
+    pre-v9 processing jobs are failed closed because a call may already have
+    been billed; pending jobs remain. Set `PRAGMA user_version = 9`.
+
+Back up the database before deploying this migration. The rebuild requires disk
+space for copied tables/indexes and WAL, and startup time proportional to retained
+data. Audit events intentionally outlive projects and are not cascaded.
 
 Legacy tables are retained for inspection but are not read by the application.
 
 ### Live records
 
-Raw `LogRecord`s live in `metrics/repository/memory`, keyed by project. Each
-`Append` and `Recent` prunes entries older than the rolling window. This bounds
-memory by (active projects × request rate × window), not by uptime. A restart
-loses the current window and the next snapshot starts fresh; history remains in
-SQLite.
+Raw `LogRecord`s are journaled in SQLite and cached in
+`metrics/repository/memory`, keyed by project. A short
+map lock protects lookup; each project has its own record lock. Appends track the
+earliest timestamp and skip full-window pruning until an event can expire;
+append-only sweeps run at most once per second (or once per window if shorter).
+Reads still prune at the exact cutoff. Out-of-order records remain supported.
+Already expired input is not retained. Pruning
+clears expired backing-array references. Active discovery reads each window's
+latest timestamp atomically, rather than scanning every record or waiting for a
+busy project's lock; empty idle entries are reclaimed opportunistically.
+
+`Recent` returns a copy and exact percentile calculation still sorts raw latency
+values. REST and initial WebSocket snapshots remain freshly computed: there is
+no stale-cache or approximate-percentile change. The IP-count map grows with
+actual cardinality instead of preallocating by request count. Memory still scales
+with active traffic and window size, bounded by admission limits that are not
+an RSS guarantee. Restart reconstructs unexpired committed batches; startup
+fails closed if current memory limits cannot accommodate them. See
+`docs/performance-hardening.md` for earlier benchmark scope and results.
 
 ## 6. Auth and trust
 
@@ -309,6 +422,13 @@ control plane.
 the behavior is fail-closed, so at least one admin must be configured before
 mutating routes become usable.
 
+Project-level authorization is separate from admin rights. `project.CanAccess`
+grants access to the owner, explicitly granted viewers, or an admin. Viewer
+membership is independent of the existing owner, so clearing an owner does not
+remove viewers. Unauthorized reads return 404 rather than 403, and each denial
+is recorded as `access.denied`. The admin-only known-user directory is populated
+only after trusted identity reaches `/api/auth/me`, not from arbitrary input.
+
 ## 7. Realtime design
 
 Envelope:
@@ -330,32 +450,51 @@ The hub groups subscribers by project. Each client has:
 - `done chan struct{}` — closed exactly once via `sync.Once`.
 
 Broadcast copies the subscriber slice under `RLock`, then performs a
-non-blocking send per client (`send`, `done`, `default`). A slow client drops
-events instead of stalling the worker. Unregister closes `done`, removes the
-client, and the writer goroutine exits. Because `send` is never closed, the
-classic "send on closed channel" panic is structurally impossible.
+non-blocking send per client (`send`, `done`, `default`). A full queue causes
+that subscriber to be unregistered and disconnected, rather than silently
+losing an event on a still-open stream. Healthy subscribers continue normally.
+Reconnect obtains a fresh snapshot and the SPA refetches metric/incident history;
+WebSockets remain best-effort notifications, not a durable event log. Unregister
+closes `done`, removes the client, and the writer goroutine exits. Because `send`
+is never closed, the classic "send on closed channel" panic is structurally impossible.
 
 The handler runs one reader goroutine (disconnect detection and pong deadlines)
-and one writer loop (messages and pings). The HTTP server has no `WriteTimeout`
-so long-lived websockets are not cut off.
+and one writer loop (messages and pings). The HTTP server has no `WriteTimeout`;
+the handler instead enforces a fixed five-minute authentication lifetime from
+request entry. An independent expiry timer sends close code `1001`
+("authentication refresh required") and closes the socket, even if the writer
+is waiting on a snapshot or access fence. All data-write deadlines are capped
+at expiry, and initial snapshot loading receives the expiring request context.
+The close control frame alone gets up to five seconds of I/O grace. Pongs only
+extend the separate idle read deadline, never the authentication lifetime.
 
 ## 8. SPA
 
 ```text
 src/
-  app.tsx                    routes: / and /p/:projectId
+  app.tsx                    routes: /, /p/:projectId, /audit
   main.tsx                   QueryClient + BrowserRouter
   types/api.ts               zod schemas mirroring Go JSON
-  lib/api.ts                 typed fetch, 401 → /oauth2/start
+  lib/api.ts                 typed fetch, 204 handling, 401 → /oauth2/start
   lib/live-store.ts          ring buffer + useSyncExternalStore
   lib/query.ts               TanStack Query defaults
-  features/projects|thresholds|metrics/  REST clients
-  features/live/connection.ts            reconnecting websocket
-  components/charts/TimeSeries.tsx       uPlot lifecycle
-  components/layout/AppShell.tsx         shell + identity
+  features/identity/         /api/auth/me + shared useMe() hook
+  features/projects/         project lifecycle REST clients
+  features/thresholds|metrics/  REST clients
+  features/audit/            audit feed client + query builder
+  features/live/connection.ts    reconnecting websocket
+  components/charts/TimeSeries.tsx  uPlot lifecycle
+  components/layout/AppShell.tsx    shell, identity, admin nav
   routes/Dashboard.tsx
   routes/ProjectDetail.tsx
+  routes/AuditLog.tsx
 ```
+
+Admin-only surfaces are hidden, not just disabled: the dashboard drops the
+"New project" control, the project page only renders the key/ownership/delete
+cards for admins, and the audit route explains that it is restricted instead of
+fetching (the API would answer 403). The server remains the authority for every
+one of these actions.
 
 ### Two data lanes
 
@@ -372,10 +511,15 @@ React never maps over samples for rendering.
 
 ### Reconnect and session expiry
 
-`LiveConnection` reconnects with exponential backoff (1s → 30s). After three
-consecutive failures it probes `/api/auth/me`; a 401 redirects to
+`LiveConnection` reconnects with exponential backoff (1s → 30s), including when
+the API closes a connection at its five-minute authentication limit. Every
+reconnect passes through Caddy `forward_auth` and project authorization again.
+After three consecutive failures it probes `/api/auth/me`; a 401 redirects to
 `/oauth2/start?rd=…` instead of retrying forever. The initial websocket message
-is a full snapshot, so a reconnect immediately repopulates the chart.
+is a full snapshot, so a reconnect immediately repopulates the chart. This bounds
+streaming after the proxy would reject a new handshake, not identity-provider
+revocation latency: oauth2-proxy has a separate one-hour `cookie_refresh` policy
+and provider-specific revocation behavior.
 
 ## 9. Deployment
 
@@ -402,30 +546,62 @@ docker compose
 
 - **Single writer.** SQLite plus a process-local hub means one API instance.
   Scaling out requires a shared store and a pub/sub bus.
-- **Synchronous explanation.** The worker calls the explainer inline; a Gemini
-  call can add up to 4 seconds to a tick. The per-project rate limit (one call
-  per 60s) and the deterministic fallback bound the damage. A queue would be
-  the next step.
-- **Memory window is per process.** A restart loses up to one window of raw
-  requests, so the first snapshot after restart may be sparse.
+- **Asynchronous advisory analysis.** With a Gemini API key, a bounded SQLite
+  queue and one background goroutine enrich persisted alerts using Gemini Decisions. Before dispatch,
+  the worker persists a daily call reservation and marks the job dispatched.
+  A call with an uncertain outcome is failed instead of retried; jobs interrupted
+  before dispatch remain recoverable.
+  Queue-full and failed cases preserve the rule-based alert. Without a key,
+  no jobs are created or processed; existing pending jobs resume when the key
+  is restored. The provider receives aggregate metrics and anonymized endpoint
+  summaries, not IPs or paths. Completed diagnoses retain that evidence.
+  Baseline snapshots are selected before the incident window and summarized
+  using medians; their time span does not guarantee continuous coverage.
+  Suggestions require a baseline, at least 20 requests and a model evidence
+  probability of 0.7; these initial gates are heuristics, not measured accuracy.
+  The 30-second attempt interval is per process. The daily reservation limit
+  bounds application calls, not total provider costs or other clients.
+- **Live journal is short-lived.** Recovery preserves only still-unexpired
+  records; it is not long-term event storage or exactly-once ingestion.
 - **Dedupe is per anomaly type.** A project can have at most one alert of each
   type per `DEDUPE_WINDOW`, regardless of severity changes.
-- **No HTTP history endpoint yet.** `SnapshotRepository.Range` and
-  `metrics.Usecase.History` exist, but the SPA currently builds history from
-  the live stream. Adding `GET /api/projects/{id}/metrics/history` is small.
-- **Anomaly list is capped** at 100 by default (1000 maximum) and is not
-  paginated.
-- **LLM output is untrusted text.** It is rendered as text, not HTML.
+- **Graph history is bounded to the newest 900 snapshots and 4 MiB of endpoint
+  JSON.** When that byte budget is reached, fewer newest snapshots are returned.
+  A single oversized newest snapshot returns 429 rather than exhausting memory.
+  Range reads fail closed on the same endpoint-data budget; analysis then
+  withholds baseline-based suggestions. The SPA restores
+  this series from `GET /api/projects/{id}/metrics/history` on load and after
+  reconnect, then merges it with the live stream. `SnapshotRepository.Range`
+  remains the time-range query used by analysis.
+- **Anomaly API results are capped** at 100 by default (1000 maximum); the
+  dashboard paginates only the loaded recent 100, not the full historical set.
+- **Audit writes are best-effort.** If the database is unavailable, the event is
+  written to the structured log instead and the primary request still succeeds.
+  Monitor `audit record write failed` for gaps.
+- **Audit reads are exact-match.** Action, project, limit, and a composite cursor
+  are supported; there is no full-text search over details.
+- **Identity is email-based.** The local directory records emails observed at
+  trusted sign-in, not a full identity-provider directory. Renaming an account
+  requires updating ownership and viewer membership.
+- **Model output is advisory.** Closed-set answers are validated, and confidence
+  is not proof of correctness. The narrative is rendered as text, not HTML.
 
 ## 11. Testing
 
 - `domain` — compute and detection are pure and table-testable.
-- Feature usecases — memory repositories stand in for SQLite.
+- Feature usecases — memory repositories stand in for SQLite, including the
+  audit adapter used by its usecase and pruner tests.
+- `audit` — redaction, non-blocking write failure, limit clamping, and
+  action/project/cursor filters.
 - Middleware — dev injection, proxy header requirement, shared secret, admin
-  gate.
-- `internal/sqlite` — migrates a synthetic v1 schema and verifies copied rows.
+  gate, fail-closed empty admin list.
+- `internal/sqlite` — migrates a synthetic v1 schema and verifies copied rows,
+  ownership defaults, and revocation defaults.
 - `internal/server` — full HTTP lifecycle over `httptest`: create, ingest,
-  metrics, thresholds, anomalies, auth, 404/405, websocket initial snapshot.
+  metrics, thresholds, anomalies, ownership assignment, key rotate/revoke,
+  deletion, audit filters and cursor validation, auth, 404/405, websocket
+  initial snapshot, cross-user REST/WebSocket denials, and stream shutdown on
+  delete.
 - `internal/ws` — concurrent register/broadcast/unregister under `-race`.
 
 ```bash

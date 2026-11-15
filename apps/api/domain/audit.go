@@ -1,22 +1,24 @@
 package domain
 
 import (
-	"context"
 	"strings"
 	"time"
 )
 
 // Audit actions. Actions are stable identifiers, never free-form strings.
 const (
-	AuditProjectCreate   = "project.create"
-	AuditProjectDelete   = "project.delete"
-	AuditKeyRotate       = "api_key.rotate"
-	AuditKeyRevoke       = "api_key.revoke"
-	AuditThresholdUpdate = "threshold.update"
-	AuditAuthDenied      = "auth.denied"
-	AuditAdminDenied     = "admin.denied"
-	AuditIngestDenied    = "ingest.denied"
-	AuditAccessDenied    = "access.denied"
+	AuditProjectCreate       = "project.create"
+	AuditProjectOwnerAssign  = "project.owner.assign"
+	AuditProjectViewerAdd    = "project.viewer.add"
+	AuditProjectViewerRemove = "project.viewer.remove"
+	AuditProjectDelete       = "project.delete"
+	AuditKeyRotate           = "api_key.rotate"
+	AuditKeyRevoke           = "api_key.revoke"
+	AuditThresholdUpdate     = "threshold.update"
+	AuditAuthDenied          = "auth.denied"
+	AuditAdminDenied         = "admin.denied"
+	AuditIngestDenied        = "ingest.denied"
+	AuditAccessDenied        = "access.denied"
 )
 
 // Audit outcomes.
@@ -38,22 +40,7 @@ type AuditEvent struct {
 	Details         map[string]string `json:"details"`
 }
 
-// AuditRepository persists and reads audit events. There is intentionally no
-// update or delete operation exposed to callers: audit records are append-only.
-// Prune is the single operational exception — an out-of-band retention job may
-// remove rows older than the configured retention window, and no HTTP endpoint
-// can trigger it.
-type AuditRepository interface {
-	Record(ctx context.Context, event AuditEvent) error
-	List(ctx context.Context, limit int) ([]AuditEvent, error)
-	Prune(ctx context.Context, before time.Time) (int64, error)
-}
-
-// AuditSink is the minimal write surface used by middleware and handlers.
-// The audit.Usecase implements it; nil sinks are skipped by callers.
-type AuditSink interface {
-	Record(ctx context.Context, event AuditEvent) error
-}
+// AuditRepository and AuditSink live in ports.go with every other port.
 
 // SanitizeActor normalizes an email for storage. Empty stays empty.
 func SanitizeActor(email string) string {

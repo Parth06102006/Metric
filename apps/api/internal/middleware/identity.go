@@ -81,12 +81,12 @@ func recordAuthDenied(sink domain.AuditSink, r *http.Request, actorEmail, reason
 		return
 	}
 	// The path alone is recorded: no query strings, headers, or bodies.
-	sink.Record(r.Context(), domain.AuditEvent{
-		Ts:        time.Now().UTC(),
+	_ = sink.Record(r.Context(), domain.AuditEvent{
+		Ts:         time.Now().UTC(),
 		ActorEmail: domain.SanitizeActor(actorEmail),
-		Action:    domain.AuditAuthDenied,
-		Outcome:   domain.AuditOutcomeFailure,
-		RequestID: reqid.From(r.Context()),
-		Details:   map[string]string{"reason": reason, "path": r.URL.Path},
+		Action:     domain.AuditAuthDenied,
+		Outcome:    domain.AuditOutcomeFailure,
+		RequestID:  reqid.From(r.Context()),
+		Details:    map[string]string{"reason": reason, "path": r.URL.Path},
 	})
 }
