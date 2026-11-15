@@ -35,6 +35,9 @@ apps/web/test-results/
 load-test-results/
 coverage/
 
+# Local brainstorming sessions and authentication keys
+.superpowers/brainstorm/
+
 # Build output
 /bin/
 
