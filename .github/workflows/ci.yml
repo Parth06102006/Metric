@@ -123,6 +123,8 @@ jobs:
         run: bun install --frozen-lockfile
         working-directory: apps/web
       - name: Audit web dependencies
+        # Temporary exception for picomatch used through Vite/Vitest build and
+        # test tooling. Remove when the advisory publishes a patched release.
         run: make web-audit
       - name: Validate OpenAPI and generated code
         run: make api-contract-check

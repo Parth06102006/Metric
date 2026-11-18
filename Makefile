@@ -68,7 +68,7 @@ web-test: ## Run SPA unit tests
 	cd $(WEB_DIR) && bun run test
 
 web-audit: ## Audit production and development dependencies (requires network access)
-	cd $(WEB_DIR) && bun audit
+	cd $(WEB_DIR) && bun audit --ignore GHSA-fc5q-39xc-vjpf
 
 web-e2e: web-build ## Build and run Playwright browser tests (install Chromium first)
 	cd $(WEB_DIR) && bun run test:e2e
