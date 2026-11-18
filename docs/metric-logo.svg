@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">Metric</title>
+  <rect width="48" height="48" rx="12" fill="#13211b"/>
+  <path d="M42 24h-7.3a3 3 0 0 0-2.9 2.2l-3.5 12.5a.75.75 0 0 1-1.5 0l-7.6-29.4a.75.75 0 0 0-1.5 0l-3.5 12.5a3 3 0 0 1-2.9 2.2H6" fill="none" stroke="#b9edca" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

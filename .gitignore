@@ -55,3 +55,6 @@ traffic.db
 *.db
 *.db-wal
 *.db-shm
+
+# Local Pi agent configuration
+/.pi/
